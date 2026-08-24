@@ -1,0 +1,17 @@
+{
+  "name": "@bobocloud/ai-agent-plugin-official",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Official local AI Agent plugin for BOBOCLOUD.",
+  "scripts": {
+    "build": "node scripts/package.mjs --build-only",
+    "package": "node scripts/package.mjs",
+    "release:check": "node scripts/check-release-tag.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "verify": "node scripts/package.mjs --verify-only"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
