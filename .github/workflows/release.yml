@@ -21,9 +21,16 @@ jobs:
       - run: npm run release:check
         if: startsWith(github.ref, 'refs/tags/')
       - run: npm run package
+      - id: artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
+          echo "package=artifacts/bobocloud.ai-agent-${version}.boboplugin" >> "$GITHUB_OUTPUT"
+          echo "checksum=artifacts/bobocloud.ai-agent-${version}.boboplugin.sha256" >> "$GITHUB_OUTPUT"
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            artifacts/*.boboplugin
-            artifacts/*.sha256
+            ${{ steps.artifact.outputs.package }}
+            ${{ steps.artifact.outputs.checksum }}

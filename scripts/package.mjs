@@ -132,7 +132,7 @@ function assertManifest(manifest) {
       !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(manifest.version) || manifest.version !== packageMetadata.version) {
     throw new Error('Unexpected plugin identity or package schema.');
   }
-  if (manifest.engines.bobocloud !== '>=2.7.0 <3.0.0' || manifest.engines.pluginApi !== '^1.4.0' || manifest.main !== 'dist/extension.js') {
+  if (manifest.engines.bobocloud !== '>=2.8.0 <3.0.0' || manifest.engines.pluginApi !== '^1.5.0' || manifest.main !== 'dist/extension.js') {
     throw new Error('BOBOCLOUD range, Plugin API range, or entry point is invalid.');
   }
   if (!Array.isArray(manifest.activationEvents) || !manifest.activationEvents.includes('onStartupFinished')) {
