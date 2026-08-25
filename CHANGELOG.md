@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0 - 2026-08-25
+
+- Integrate with the refreshed host workbench controls embedded beside the Agent composer.
+- Expose `goal` and `chat` as host slash-command modes through `/goal` and `/chat`.
+- Keep five reasoning efforts and three access policies session-scoped while preserving host-owned authority.
+- Preserve the Plugin API 1.5 capability contract without adding permissions or privileged plugin code.
+
 ## 1.1.0 - 2026-08-25
 
 - Add `xhigh` and distinct bounded output budgets for all five reasoning efforts.

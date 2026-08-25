@@ -27,7 +27,7 @@ No plugin-provided HTML, CSS, SVG, DOM callback, executable path, shell string, 
 
 ## Plugin API Contract
 
-Version `1.1.0` targets BOBOCLOUD `>=2.8.0 <3.0.0` and Plugin API `^1.5.0`.
+Version `1.2.0` targets BOBOCLOUD `>=2.8.0 <3.0.0` and Plugin API `^1.5.0`.
 
 The runtime uses only these capabilities:
 

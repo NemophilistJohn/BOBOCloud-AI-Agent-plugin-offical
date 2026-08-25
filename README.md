@@ -4,14 +4,15 @@ Official local AI Agent plugin for BOBOCLOUD. It adds an Agent workbench as a pe
 
 The plugin is written in plain JavaScript and has no runtime dependencies or native modules. Privileged work remains in BOBOCLOUD's cross-platform host brokers, so one package can run on Windows, macOS, and Linux.
 
-Version `1.1.0` requires BOBOCLOUD `>=2.8.0 <3.0.0` and Plugin API `^1.5.0`.
+Version `1.2.0` requires BOBOCLOUD `>=2.8.0 <3.0.0` and Plugin API `^1.5.0`.
 
 ## Capabilities
 
 - Persistent, searchable Agent sessions rendered by the host workbench.
-- `chat` and multi-step `goal` modes.
+- `chat` and multi-step `goal` modes, selected from the composer with `/chat` and `/goal`.
 - `low`, `medium`, `high`, `xhigh`, and `max` reasoning effort selection.
 - Session-scoped `ask`, `auto`, and `full` access-mode display state without moving authority into the plugin.
+- Host-rendered access and reasoning controls beside the composer instead of global page controls.
 - Discovery and explicit selection of workspace or user `SKILL.md` files.
 - Automatic threshold-based context compaction with durable recovery summaries, recent-turn retention, and visible progress.
 - Structured workspace list, read, and search tools.
@@ -47,15 +48,15 @@ npm run verify
 `npm run package` copies the self-contained source to `dist/extension.js`, regenerates every manifest integrity hash, and writes a deterministic artifact:
 
 ```text
-artifacts/bobocloud.ai-agent-1.1.0.boboplugin
-artifacts/bobocloud.ai-agent-1.1.0.boboplugin.sha256
+artifacts/bobocloud.ai-agent-1.2.0.boboplugin
+artifacts/bobocloud.ai-agent-1.2.0.boboplugin.sha256
 ```
 
 The archive contains only `manifest.json`, `dist/extension.js`, and the three locale catalogs. Source, tests, scripts, and repository metadata are intentionally excluded.
 
 ## Install
 
-Use BOBOCLOUD's Extensions view to install the `.boboplugin` archive, then enable the plugin. Version `1.1.0` requires BOBOCLOUD `2.8.0` or newer. Configure at least one Chat model in BOBOCLOUD's AI settings. The Agent activity item appears only while the plugin is enabled.
+Use BOBOCLOUD's Extensions view to install the `.boboplugin` archive, then enable the plugin. Version `1.2.0` requires BOBOCLOUD `2.8.0` or newer. Configure at least one Chat model in BOBOCLOUD's AI settings. The Agent activity item appears only while the plugin is enabled.
 
 The Agent does not share conversations with Chat and does not replace inline completion. It only reuses host-owned model connection profiles through opaque model references.
 
@@ -72,13 +73,13 @@ The Agent does not share conversations with Chat and does not replace inline com
 Marketplace artifact URL pattern:
 
 ```text
-https://raw.githubusercontent.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/v1.1.0/artifacts/bobocloud.ai-agent-1.1.0.boboplugin
+https://raw.githubusercontent.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/v1.2.0/artifacts/bobocloud.ai-agent-1.2.0.boboplugin
 ```
 
 The release workflow also publishes the same bytes as a GitHub Release asset:
 
 ```text
-https://github.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/releases/download/v1.1.0/bobocloud.ai-agent-1.1.0.boboplugin
+https://github.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/releases/download/v1.2.0/bobocloud.ai-agent-1.2.0.boboplugin
 ```
 
 ## 中文说明
@@ -87,4 +88,4 @@ https://github.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/releases/do
 
 插件本身不接触 Node.js、Electron、绝对路径、Shell、网络、密钥或原始 IPC。文件写入和进程执行都必须经过 BOBOCLOUD 的显式审批，并由宿主在当前工作区边界内完成。
 
-`1.1.0` 面向 BOBOCLOUD 2.8 / Plugin API 1.5：增加 `xhigh` 思考强度、会话级访问模式镜像和自动上下文压缩。访问模式不授予权限，真正的自动批准规则始终由可信宿主掌握。
+`1.2.0` 面向 BOBOCLOUD 2.8 / Plugin API 1.5：访问模式与五档思考强度由宿主显示在输入框旁，`/goal` 与 `/chat` 用于切换会话模式；同时保留自动上下文压缩。访问模式不授予权限，真正的自动批准规则始终由可信宿主掌握。
