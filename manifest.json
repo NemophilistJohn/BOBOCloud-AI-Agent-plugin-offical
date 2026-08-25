@@ -3,7 +3,7 @@
   "id": "bobocloud.ai-agent",
   "displayName": "BOBOCLOUD AI Agent",
   "description": "Official local workspace Agent with goal mode, Skills, structured tools, and explicit approvals.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "engines": {
     "bobocloud": ">=2.8.0 <3.0.0",
     "pluginApi": "^1.5.0"
@@ -32,7 +32,7 @@
   "integrity": {
     "algorithm": "sha256",
     "files": {
-      "dist/extension.js": "cac6e6e823c52ac52874473507e61d912eb93e8a609d36de713e7773cc828462",
+      "dist/extension.js": "f69a15a28670c088cab602d3ccc6d95a6c734c83cbdb4730cc11e9a33e561e4c",
       "language-packs/en/messages.json": "aaac559f0d16623d899bf5832b6596feca92af11cb1af902330b348d2773d839",
       "language-packs/ja/messages.json": "edf7d4c00084cdfb7786401751a4a20ede0e5f46b51b729e31b5f5ab11a7267f",
       "language-packs/zh-CN/messages.json": "ac0c0a46b1ce88df029e03258bd7541ac9d38cdc07e7f9089ab43297b84ba029"

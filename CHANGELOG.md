@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+## 1.3.0 - 2026-08-25
+
+- Summarize the first request into a Unicode-safe, width-bounded session title, with optional low-cost model refinement and deterministic fallback.
+
 ## 1.2.0 - 2026-08-25
 
 - Integrate with the refreshed host workbench controls embedded beside the Agent composer.

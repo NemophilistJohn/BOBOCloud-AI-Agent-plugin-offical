@@ -17,6 +17,7 @@ function harness(options = {}) {
   const commands = new Map();
   const states = [];
   const modelCalls = [];
+  const titleCalls = [];
   const toolCalls = [];
   const cancellations = [];
   const writes = [];
@@ -51,6 +52,11 @@ function harness(options = {}) {
         return { models: [{ ref: 'chat:test', purpose: 'chat', name: 'Test', provider: 'test', modelId: 'test-1', configured: true }] };
       },
       async generate(args) {
+        if (String(args.requestId || '').startsWith('title-')) {
+          titleCalls.push(structuredClone(args));
+          if (typeof options.titleResponse === 'function') return options.titleResponse(args);
+          return options.titleResponse || { content: 'Focused Agent task', toolCalls: [] };
+        }
         modelCalls.push(structuredClone(args));
         const response = modelResponses.shift();
         if (typeof response === 'function') return response(args);
@@ -89,6 +95,7 @@ function harness(options = {}) {
     commands,
     states,
     modelCalls,
+    titleCalls,
     toolCalls,
     cancellations,
     writes,
@@ -96,6 +103,63 @@ function harness(options = {}) {
     get descriptor() { return descriptor; }
   };
 }
+
+test('summarizes and sanitizes first prompts within a visual-width budget', () => {
+  const prompt = '请你先探索代码，并参照 Codex、OpenCode 等开源 Agent 的架构，分析本云编译器的 AI Agent 服务如何扩展，最后给出详细计划。';
+  const title = __testing.summarizeSessionTitle(prompt);
+  assert.equal(title, '本云编译器的 AI Agent 服务如何扩展');
+  assert.equal(__testing.titleUnits(title) <= __testing.maxSessionTitleUnits, true);
+  assert.equal(__testing.shouldRefineSessionTitle(prompt), true);
+  assert.equal(__testing.summarizeSessionTitle('Please help me fix auth.ts token refresh failures.'), 'fix auth.ts token refresh failures');
+  const safeUnicodeTitle = __testing.summarizeSessionTitle('请修复\u202Eabc\u200b 😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀');
+  assert.equal(safeUnicodeTitle.includes('\u202E'), false);
+  assert.equal(safeUnicodeTitle.includes('\u200b'), false);
+  assert.equal(safeUnicodeTitle.endsWith('…'), true);
+  assert.equal(__testing.titleUnits(safeUnicodeTitle) <= __testing.maxSessionTitleUnits, true);
+  assert.equal(__testing.titleUnits(__testing.summarizeSessionTitle('请修复 😀'.repeat(40))) <= __testing.maxSessionTitleUnits, true);
+  const combiningFlood = __testing.summarizeSessionTitle('Fix a' + '\u0301'.repeat(500) + ' title rendering');
+  assert.equal(combiningFlood.length <= __testing.maxSessionTitleCodeUnits, true);
+  assert.equal(combiningFlood.endsWith('…'), true);
+});
+
+test('refines a complex session title with the configured model and persists it', async () => {
+  await deactivate();
+  const host = harness({
+    modelResponses: [{ content: 'The design report is ready.', toolCalls: [] }],
+    titleResponse: { content: '云编译 Agent 工具架构', toolCalls: [] }
+  });
+  await activate(host.context);
+  const prompt = '请你探索代码，分析如何把云编译、环境资源和自动调试能力作为安全工具提供给 AI Agent，并给出分阶段计划。';
+  const sent = host.commands.get(__testing.commands.send).handler({ text: prompt, modelRef: 'chat:test' });
+  assert.equal(sent.accepted, true);
+  const immediate = await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'running'));
+  assert.notEqual(immediate.activeSession.title, prompt);
+  assert.equal(__testing.titleUnits(immediate.activeSession.title) <= __testing.maxSessionTitleUnits, true);
+  const titled = await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.title === '云编译 Agent 工具架构'));
+  assert.equal(titled.activeSession.title, '云编译 Agent 工具架构');
+  assert.equal(host.titleCalls.length, 1);
+  assert.equal(host.titleCalls[0].reasoningEffort, 'low');
+  assert.equal(host.titleCalls[0].maxTokens, 64);
+  assert.equal(host.titleCalls[0].tools, undefined);
+  await waitFor(() => host.writes.some((value) => value.sessions?.some((session) => session.title === '云编译 Agent 工具架构')));
+  await deactivate();
+});
+
+test('keeps the deterministic title when model title generation fails', async () => {
+  await deactivate();
+  const host = harness({
+    modelResponses: [{ content: 'Done.', toolCalls: [] }],
+    titleResponse() { throw new Error('title unavailable'); }
+  });
+  await activate(host.context);
+  const prompt = 'Please inspect the workspace, diagnose the package installation failure, and propose a safe repair plan with tests.';
+  const expected = __testing.summarizeSessionTitle(prompt);
+  host.commands.get(__testing.commands.send).handler({ text: prompt, modelRef: 'chat:test' });
+  await waitFor(() => host.titleCalls.length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(__testing.getState().activeSession.title, expected);
+  await deactivate();
+});
 
 function storedSession(messages, options = {}) {
   const createdAt = '2026-08-25T00:00:00.000Z';
