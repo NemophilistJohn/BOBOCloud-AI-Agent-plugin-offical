@@ -12,6 +12,9 @@ const packageMetadata = JSON.parse(await fs.readFile(path.join(root, 'package.js
 const sourcePath = path.join(root, 'src', 'extension.js');
 const outputPath = path.join(root, 'dist', 'extension.js');
 const artifactsRoot = path.join(root, 'artifacts');
+const MAX_ARCHIVE_BYTES = 10 * 1024 * 1024;
+const MAX_ENTRY_BYTES = 4 * 1024 * 1024;
+const MAX_PACKAGE_ENTRIES = 32;
 const packageFiles = Object.freeze([
   'dist/extension.js',
   'language-packs/en/messages.json',
@@ -100,30 +103,55 @@ export function createZip(entries) {
 }
 
 export function readZip(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 22 || buffer.length > MAX_ARCHIVE_BYTES) throw new Error('ZIP archive size is invalid.');
   const end = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
   if (end < 0) throw new Error('ZIP end record is missing.');
   const count = buffer.readUInt16LE(end + 10);
+  if (count < 1 || count > MAX_PACKAGE_ENTRIES) throw new Error('ZIP entry count is invalid.');
   let cursor = buffer.readUInt32LE(end + 16);
   const values = new Map();
   for (let index = 0; index < count; index += 1) {
+    if (cursor < 0 || cursor + 46 > end) throw new Error('ZIP central directory is truncated.');
     if (buffer.readUInt32LE(cursor) !== 0x02014b50) throw new Error('ZIP central directory is invalid.');
+    const flags = buffer.readUInt16LE(cursor + 8);
     const method = buffer.readUInt16LE(cursor + 10);
     const expectedCrc = buffer.readUInt32LE(cursor + 16);
     const compressedSize = buffer.readUInt32LE(cursor + 20);
+    const uncompressedSize = buffer.readUInt32LE(cursor + 24);
     const nameLength = buffer.readUInt16LE(cursor + 28);
     const extraLength = buffer.readUInt16LE(cursor + 30);
     const commentLength = buffer.readUInt16LE(cursor + 32);
     const localOffset = buffer.readUInt32LE(cursor + 42);
     const name = buffer.subarray(cursor + 46, cursor + 46 + nameLength).toString('utf8');
+    if (flags !== 0x0800 || (method !== 0 && method !== 8)) throw new Error('ZIP entry flags or compression method are unsupported.');
+    if (!name || name.includes('\\') || path.posix.normalize(name) !== name || name.startsWith('/') || name.startsWith('../') || name === '..') {
+      throw new Error('ZIP entry path is invalid.');
+    }
+    if (values.has(name)) throw new Error('ZIP archive contains a duplicate entry: ' + name + '.');
+    if (uncompressedSize > MAX_ENTRY_BYTES || compressedSize > MAX_ARCHIVE_BYTES) throw new Error('ZIP entry size exceeds the package limit.');
+    if (localOffset + 30 > buffer.length || buffer.readUInt32LE(localOffset) !== 0x04034b50) throw new Error('ZIP local entry is invalid.');
+    const localFlags = buffer.readUInt16LE(localOffset + 6);
+    const localMethod = buffer.readUInt16LE(localOffset + 8);
+    const localCrc = buffer.readUInt32LE(localOffset + 14);
+    const localCompressedSize = buffer.readUInt32LE(localOffset + 18);
+    const localUncompressedSize = buffer.readUInt32LE(localOffset + 22);
     const localNameLength = buffer.readUInt16LE(localOffset + 26);
     const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+    const localName = buffer.subarray(localOffset + 30, localOffset + 30 + localNameLength).toString('utf8');
+    if (localFlags !== flags || localMethod !== method || localCrc !== expectedCrc || localCompressedSize !== compressedSize ||
+        localUncompressedSize !== uncompressedSize || localName !== name) {
+      throw new Error('ZIP local and central entry metadata do not match.');
+    }
     const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    if (dataStart < 0 || dataStart + compressedSize > buffer.length) throw new Error('ZIP entry data is truncated.');
     const compressed = buffer.subarray(dataStart, dataStart + compressedSize);
-    const content = method === 8 ? zlib.inflateRawSync(compressed) : Buffer.from(compressed);
+    const content = method === 8 ? zlib.inflateRawSync(compressed, { maxOutputLength: MAX_ENTRY_BYTES }) : Buffer.from(compressed);
+    if (content.length !== uncompressedSize) throw new Error('ZIP entry size mismatch for ' + name + '.');
     if (crc32(content) !== expectedCrc) throw new Error('ZIP CRC mismatch for ' + name + '.');
     values.set(name, content);
     cursor += 46 + nameLength + extraLength + commentLength;
   }
+  if (cursor !== end) throw new Error('ZIP central directory length is invalid.');
   return values;
 }
 
@@ -142,12 +170,25 @@ function assertManifest(manifest) {
     'commands.register', 'agents.register', 'models.generate', 'workspace.read',
     'workspace.write', 'process.execute', 'skills.read', 'storage.local'
   ];
-  for (const permission of requiredPermissions) {
-    if (!manifest.permissions.includes(permission)) throw new Error('Missing permission: ' + permission);
+  if (!Array.isArray(manifest.permissions) || JSON.stringify([...manifest.permissions].sort()) !== JSON.stringify([...requiredPermissions].sort())) {
+    throw new Error('Plugin permissions must match the reviewed Agent permission set exactly.');
   }
+  const expectedLocalization = {
+    default: 'language-packs/en/messages.json',
+    en: 'language-packs/en/messages.json',
+    'zh-CN': 'language-packs/zh-CN/messages.json',
+    ja: 'language-packs/ja/messages.json'
+  };
+  if (JSON.stringify(manifest.localization) !== JSON.stringify(expectedLocalization)) {
+    throw new Error('Plugin localization paths are invalid.');
+  }
+  if (!manifest.integrity || manifest.integrity.algorithm !== 'sha256') throw new Error('Plugin integrity algorithm must be SHA-256.');
   const declared = Object.keys(manifest.integrity && manifest.integrity.files || {}).sort();
   if (JSON.stringify(declared) !== JSON.stringify([...packageFiles].sort())) {
     throw new Error('integrity.files must cover every package file exactly once.');
+  }
+  for (const digest of Object.values(manifest.integrity.files)) {
+    if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error('Plugin integrity contains an invalid SHA-256 digest.');
   }
 }
 
@@ -179,11 +220,11 @@ export async function buildPackage(options = {}) {
   await fs.writeFile(artifactPath, archive);
   const digest = sha256(archive);
   await fs.writeFile(artifactPath + '.sha256', digest + '  ' + path.basename(artifactPath) + '\n', 'utf8');
-  await verifyPackage(artifactPath);
+  await verifyPackage(artifactPath, { compareWorkspace: true, verifyChecksum: true });
   return { manifest, artifactPath, sha256: digest, size: archive.length };
 }
 
-export async function verifyPackage(artifactPath) {
+export async function verifyPackage(artifactPath, options = {}) {
   const archive = await fs.readFile(artifactPath);
   const entries = readZip(archive);
   const names = [...entries.keys()].sort();
@@ -191,12 +232,28 @@ export async function verifyPackage(artifactPath) {
   if (JSON.stringify(names) !== JSON.stringify(expectedNames)) throw new Error('Archive contains an unexpected file set.');
   const manifest = JSON.parse(entries.get('manifest.json').toString('utf8'));
   assertManifest(manifest);
+  const expectedArtifactName = manifest.id + '-' + manifest.version + '.boboplugin';
+  if (path.basename(artifactPath) !== expectedArtifactName) throw new Error('Artifact filename does not match the package identity.');
   for (const relativePath of packageFiles) {
     if (sha256(entries.get(relativePath)) !== manifest.integrity.files[relativePath]) {
       throw new Error('Integrity mismatch for ' + relativePath + '.');
     }
   }
-  return { manifest, sha256: sha256(archive), size: archive.length, files: names };
+  if (options.compareWorkspace === true) {
+    const workspaceManifest = await fs.readFile(manifestPath);
+    if (!workspaceManifest.equals(entries.get('manifest.json'))) throw new Error('Artifact manifest does not match the workspace manifest.');
+    for (const relativePath of packageFiles) {
+      const workspaceFile = await fs.readFile(path.join(root, ...relativePath.split('/')));
+      if (!workspaceFile.equals(entries.get(relativePath))) throw new Error('Artifact entry does not match the workspace file: ' + relativePath + '.');
+    }
+  }
+  const archiveDigest = sha256(archive);
+  if (options.verifyChecksum === true) {
+    const checksum = (await fs.readFile(artifactPath + '.sha256', 'utf8')).trim();
+    const match = checksum.match(/^([a-f0-9]{64})  ([A-Za-z0-9._-]+)$/);
+    if (!match || match[1] !== archiveDigest || match[2] !== expectedArtifactName) throw new Error('Artifact checksum file is invalid.');
+  }
+  return { manifest, sha256: archiveDigest, size: archive.length, files: names };
 }
 
 async function main() {
@@ -204,7 +261,7 @@ async function main() {
   if (verifyOnly) {
     const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
     const artifactPath = path.join(artifactsRoot, manifest.id + '-' + manifest.version + '.boboplugin');
-    const result = await verifyPackage(artifactPath);
+    const result = await verifyPackage(artifactPath, { compareWorkspace: true, verifyChecksum: true });
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
     return;
   }

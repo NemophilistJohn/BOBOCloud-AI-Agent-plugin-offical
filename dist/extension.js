@@ -24,6 +24,10 @@ const MAX_SESSION_TITLE_SOURCE_CHARS = 4096;
 const MAX_SESSION_TITLE_UNITS = 36;
 const MAX_SESSION_TITLE_CODE_UNITS = 120;
 const MODEL_TITLE_THRESHOLD_UNITS = 28;
+const MAX_TOOL_CALLS_PER_RUN = 64;
+const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS = 3;
+const MAX_TOOL_RESULT_CHARS = 96 * 1024;
+const MAX_TOOL_RESULT_CHARS_PER_RUN = 512 * 1024;
 
 const COMMANDS = Object.freeze({
   create: EXTENSION_ID + '.createSession',
@@ -300,6 +304,31 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function uniqueLatest(values, identity) {
+  const seen = new Set();
+  const result = [];
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const value = values[index];
+    const key = identity(value);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.unshift(value);
+  }
+  return result;
+}
+
+function normalizedTitleValues(value) {
+  if (!plain(value)) return {};
+  const result = {};
+  for (const [key, item] of Object.entries(value).slice(0, 16)) {
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(key)) continue;
+    if (typeof item === 'string') result[key] = text(item, 500);
+    else if (typeof item === 'number' && Number.isFinite(item)) result[key] = item;
+    else if (typeof item === 'boolean') result[key] = item;
+  }
+  return result;
+}
+
 function selectedMode(value) {
   return value === 'goal' ? 'goal' : 'chat';
 }
@@ -330,6 +359,7 @@ function errorMessage(error) {
     AGENT_FILE_CHANGED: 'error.fileChanged',
     AGENT_APPROVAL_EXPIRED: 'error.approvalExpired',
     AGENT_APPROVAL_NOT_FOUND: 'error.approvalExpired',
+    AGENT_CANCELLED: 'error.cancelled',
     EXTENSION_PERMISSION_DENIED: 'error.permissionDenied',
     EXTENSION_CANCELLED: 'error.cancelled'
   };
@@ -343,19 +373,20 @@ function normalizeMessage(value) {
     id: value.id,
     role: value.role,
     content: text(value.content),
-    reasoning: text(value.reasoning),
+    reasoning: '',
     createdAt: text(value.createdAt, 64) || now()
   };
 }
 
 function normalizeTimeline(value) {
   if (!plain(value) || !validId(value.id)) return null;
+  const kind = ['thought', 'tool', 'status', 'skill', 'compaction', 'error'].includes(value.kind) ? value.kind : 'status';
   return {
     id: value.id,
-    kind: ['thought', 'tool', 'status', 'skill', 'compaction', 'error'].includes(value.kind) ? value.kind : 'status',
+    kind,
     titleKey: text(value.titleKey, 160) || 'timeline.status',
-    titleValues: plain(value.titleValues) ? value.titleValues : {},
-    detail: text(value.detail, 32 * 1024),
+    titleValues: normalizedTitleValues(value.titleValues),
+    detail: kind === 'thought' ? '' : text(value.detail, 32 * 1024),
     status: ['pending', 'running', 'waiting', 'completed', 'failed', 'rejected'].includes(value.status) ? value.status : 'completed',
     createdAt: text(value.createdAt, 64) || now()
   };
@@ -363,14 +394,21 @@ function normalizeTimeline(value) {
 
 function normalizeGoal(value) {
   if (!plain(value) || !Array.isArray(value.steps)) return null;
+  const stepIds = new Set();
   return {
-    title: text(value.title, 300) || translated('goal.defaultTitle'),
+    title: text(value.title, 300),
     status: ['pending', 'in-progress', 'completed', 'blocked'].includes(value.status) ? value.status : 'pending',
-    steps: value.steps.slice(0, 8).map((step, index) => ({
-      id: validId(step && step.id) ? step.id : 'step-' + index,
-      titleKey: text(step && step.titleKey, 160) || 'goal.step.understand',
-      status: ['pending', 'in-progress', 'completed', 'blocked'].includes(step && step.status) ? step.status : 'pending'
-    }))
+    steps: value.steps.slice(0, 8).map((step, index) => {
+      let stepId = validId(step && step.id) ? step.id : 'restored-step-' + index;
+      let suffix = 0;
+      while (stepIds.has(stepId)) stepId = 'restored-step-' + index + '-' + (++suffix);
+      stepIds.add(stepId);
+      return {
+        id: stepId,
+        titleKey: text(step && step.titleKey, 160) || 'goal.step.understand',
+        status: ['pending', 'in-progress', 'completed', 'blocked'].includes(step && step.status) ? step.status : 'pending'
+      };
+    })
   };
 }
 
@@ -408,7 +446,7 @@ function normalizeSession(value) {
     : 'idle';
   const session = {
     id: value.id,
-    title: text(value.title, 160),
+    title: truncateSessionTitle(value.title),
     createdAt: text(value.createdAt, 64) || now(),
     updatedAt: text(value.updatedAt, 64) || now(),
     status: status === 'running' || status === 'waiting-approval' ? 'cancelled' : status,
@@ -417,8 +455,8 @@ function normalizeSession(value) {
     accessMode: selectedAccessMode(value.accessMode),
     modelRef: validId(value.modelRef) ? value.modelRef : '',
     skillIds: selectedSkills(value.skillIds),
-    messages: Array.isArray(value.messages) ? value.messages.map(normalizeMessage).filter(Boolean).slice(-MAX_MESSAGES) : [],
-    timeline: Array.isArray(value.timeline) ? value.timeline.map(normalizeTimeline).filter(Boolean).slice(-MAX_TIMELINE) : [],
+    messages: Array.isArray(value.messages) ? uniqueLatest(value.messages.map(normalizeMessage).filter(Boolean), (item) => item.id).slice(-MAX_MESSAGES) : [],
+    timeline: Array.isArray(value.timeline) ? uniqueLatest(value.timeline.map(normalizeTimeline).filter(Boolean), (item) => item.id).slice(-MAX_TIMELINE) : [],
     goal: normalizeGoal(value.goal),
     compaction: normalizeCompaction(value.compaction)
   };
@@ -442,7 +480,7 @@ function loadState(value) {
   const source = plain(value) && SUPPORTED_STORAGE_SCHEMA_VERSIONS.has(value.schemaVersion) ? value : {};
   const preferences = plain(source.preferences) ? source.preferences : {};
   const sessions = Array.isArray(source.sessions)
-    ? source.sessions.map(normalizeSession).filter(Boolean).slice(-MAX_SESSIONS)
+    ? uniqueLatest(source.sessions.map(normalizeSession).filter(Boolean), (session) => session.id).slice(-MAX_SESSIONS)
     : [];
   return {
     sessions,
@@ -460,12 +498,12 @@ function loadState(value) {
 }
 
 function makeTimeline(kind, titleKey, detail = '', status = 'completed', titleValues = {}) {
-  return { id: id('event'), kind, titleKey, titleValues, detail: text(detail, 32 * 1024), status, createdAt: now() };
+  return { id: id('event'), kind, titleKey, titleValues: normalizedTitleValues(titleValues), detail: text(detail, 32 * 1024), status, createdAt: now() };
 }
 
 function makeGoal(prompt) {
   return {
-    title: text(prompt.trim(), 300) || translated('goal.defaultTitle'),
+    title: summarizeSessionTitle(prompt) || translated('goal.defaultTitle'),
     status: 'in-progress',
     steps: [
       { id: id('step'), titleKey: 'goal.step.understand', status: 'in-progress' },
@@ -476,8 +514,8 @@ function makeGoal(prompt) {
   };
 }
 
-function activeSession() {
-  return runtime.sessions.find((session) => session.id === runtime.activeSessionId) || null;
+function activeSession(owner = runtime) {
+  return owner && owner.sessions.find((session) => session.id === owner.activeSessionId) || null;
 }
 
 function sessionTitle(session) {
@@ -487,7 +525,7 @@ function sessionTitle(session) {
 function stateGoal(goal) {
   if (!goal) return null;
   return {
-    title: goal.title,
+    title: goal.title || translated('goal.defaultTitle'),
     status: goal.status,
     steps: goal.steps.map((step) => ({ id: step.id, title: translated(step.titleKey), status: step.status }))
   };
@@ -508,16 +546,16 @@ function approvalState(pending) {
   return pending ? { id: pending.approval.id } : null;
 }
 
-function stateSnapshot() {
-  const current = activeSession();
-  const configured = runtime.models.some((model) => model.configured);
+function stateSnapshot(owner = runtime) {
+  const current = activeSession(owner);
+  const configured = owner.models.some((model) => model.configured);
   let phase = configured ? 'ready' : 'unconfigured';
   let message = configured ? translated('state.ready') : translated('state.unconfigured');
-  if (runtime.catalogError) {
+  if (owner.catalogError) {
     phase = 'error';
-    message = runtime.catalogError;
+    message = owner.catalogError;
   } else if (current) {
-    if (runtime.compacting.has(current.id)) message = translated('state.compacting');
+    if (owner.compacting.has(current.id)) message = translated('state.compacting');
     else if (current.status === 'running') message = translated('state.running');
     if (current.status === 'waiting-approval') message = translated('state.waitingApproval');
     if (current.status === 'failed') message = translated('state.failed');
@@ -527,7 +565,7 @@ function stateSnapshot() {
     phase,
     message,
     activeSessionId: current ? current.id : '',
-    sessions: [...runtime.sessions]
+    sessions: [...owner.sessions]
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
       .map((session) => ({
         id: session.id,
@@ -536,7 +574,7 @@ function stateSnapshot() {
         status: session.status,
         mode: session.mode
       })),
-    models: runtime.models.map((model) => ({
+    models: owner.models.map((model) => ({
       ref: model.ref,
       name: model.name,
       provider: model.provider,
@@ -544,12 +582,12 @@ function stateSnapshot() {
       purpose: model.purpose,
       configured: model.configured === true
     })),
-    skills: runtime.skills.map((skill) => ({
+    skills: owner.skills.map((skill) => ({
       id: skill.id,
       name: skill.name,
       description: skill.description,
       source: skill.source,
-      enabled: (current ? current.skillIds : runtime.preferences.skillIds).includes(skill.id)
+      enabled: (current ? current.skillIds : owner.preferences.skillIds).includes(skill.id)
     })),
     activeSession: current ? {
       id: current.id,
@@ -562,8 +600,8 @@ function stateSnapshot() {
       messages: current.messages.map((message) => ({ ...message })),
       timeline: current.timeline.map(stateTimeline),
       goal: stateGoal(current.goal),
-      approval: approvalState(runtime.pending.get(current.id)),
-      compacting: runtime.compacting.has(current.id),
+      approval: approvalState(owner.pending.get(current.id)),
+      compacting: owner.compacting.has(current.id),
       compaction: {
         count: current.compaction.count,
         compactedMessages: current.compaction.compactedMessages,
@@ -575,12 +613,12 @@ function stateSnapshot() {
   };
 }
 
-function persistedState() {
+function persistedState(owner = runtime) {
   const value = {
     schemaVersion: STORAGE_SCHEMA_VERSION,
-    activeSessionId: runtime.activeSessionId,
-    preferences: clone(runtime.preferences),
-    sessions: runtime.sessions.slice(-MAX_SESSIONS).map((session) => ({
+    activeSessionId: owner.activeSessionId,
+    preferences: clone(owner.preferences),
+    sessions: owner.sessions.slice(-MAX_SESSIONS).map((session) => ({
       id: session.id,
       title: session.title,
       createdAt: session.createdAt,
@@ -592,46 +630,67 @@ function persistedState() {
       modelRef: session.modelRef,
       skillIds: [...session.skillIds],
       messages: session.messages.slice(-MAX_MESSAGES).map((message) => ({ ...message })),
-      timeline: session.timeline.slice(-MAX_TIMELINE).map((item) => ({ ...item })),
+      timeline: session.timeline.slice(-MAX_TIMELINE).map((item) => ({ ...item, detail: item.kind === 'thought' ? '' : item.detail })),
       goal: session.goal ? clone(session.goal) : null,
       compaction: clone(session.compaction)
     }))
   };
-  while (new TextEncoder().encode(JSON.stringify(value)).length > MAX_PERSISTED_BYTES && value.sessions.length > 1) {
-    const removable = value.sessions.findIndex((session) => session.id !== value.activeSessionId);
+  return value;
+}
+
+function boundedPersistedState(owner = runtime) {
+  let value = persistedState(owner);
+  while (new TextEncoder().encode(JSON.stringify(value)).length > MAX_PERSISTED_BYTES && owner.sessions.length > 1) {
+    const removable = owner.sessions.findIndex((session) => session.id !== owner.activeSessionId);
     if (removable < 0) break;
-    const removedId = value.sessions[removable].id;
-    value.sessions.splice(removable, 1);
-    const runtimeIndex = runtime.sessions.findIndex((session) => session.id === removedId);
-    if (runtimeIndex >= 0) runtime.sessions.splice(runtimeIndex, 1);
+    owner.sessions.splice(removable, 1);
+    value = persistedState(owner);
   }
   return value;
 }
 
-function publish() {
-  if (!runtime || runtime.disposed || !runtime.provider) return Promise.resolve();
-  const owner = runtime;
-  const provider = runtime.provider;
-  const snapshot = stateSnapshot();
-  runtime.publishQueue = runtime.publishQueue.catch(() => {}).then(async () => {
-    if (!owner.disposed && owner.provider === provider) await provider.setState(snapshot);
+function publish(owner = runtime) {
+  if (!owner || runtime !== owner || owner.disposed || !owner.provider) return Promise.resolve();
+  owner.pendingPublish = { provider: owner.provider, snapshot: stateSnapshot(owner) };
+  if (owner.publishWriter) return owner.publishWriter;
+  owner.publishWriter = Promise.resolve().then(async () => {
+    let lastError = null;
+    while (owner.pendingPublish && runtime === owner && !owner.disposed) {
+      const pending = owner.pendingPublish;
+      owner.pendingPublish = null;
+      if (owner.provider !== pending.provider) continue;
+      try { await pending.provider.setState(pending.snapshot); }
+      catch (error) { lastError = error; }
+    }
+    owner.publishWriter = null;
+    if (lastError) throw lastError;
   });
-  return runtime.publishQueue;
+  owner.publishQueue = owner.publishWriter;
+  return owner.publishWriter;
 }
 
-function persist() {
-  if (!runtime || runtime.disposed) return Promise.resolve();
-  const owner = runtime;
-  const value = persistedState();
-  runtime.storageQueue = runtime.storageQueue.catch(() => {}).then(async () => {
-    if (!owner.disposed) await owner.context.storage.write(value);
+function persist(owner = runtime) {
+  if (!owner || runtime !== owner || owner.disposed) return Promise.resolve();
+  owner.pendingStorageValue = boundedPersistedState(owner);
+  if (owner.storageWriter) return owner.storageWriter;
+  owner.storageWriter = Promise.resolve().then(async () => {
+    let lastError = null;
+    while (owner.pendingStorageValue && runtime === owner && !owner.disposed) {
+      const value = owner.pendingStorageValue;
+      owner.pendingStorageValue = null;
+      try { await owner.context.storage.write(value); }
+      catch (error) { lastError = error; }
+    }
+    owner.storageWriter = null;
+    if (lastError) throw lastError;
   });
-  return runtime.storageQueue;
+  owner.storageQueue = owner.storageWriter;
+  return owner.storageWriter;
 }
 
-function publishAndPersist() {
-  void persist().catch(() => {});
-  void publish();
+function publishAndPersist(owner = runtime) {
+  void persist(owner).catch(() => {});
+  void publish(owner).catch(() => {});
 }
 
 function createSession(values = {}) {
@@ -893,6 +952,19 @@ function maxTokensForEffort(effort) {
   return { low: 4096, medium: 8192, high: 12288, xhigh: 16384, max: 24576 }[effort] || 8192;
 }
 
+function responseReachedOutputLimit(response) {
+  const reason = text(response && response.finishReason, 80).trim().toLowerCase();
+  return reason === 'length' || reason === 'max_tokens' || reason === 'max_output_tokens' || reason === 'max_tokens_exceeded';
+}
+
+function thoughtSeconds(startedAt) {
+  return Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+}
+
+function thoughtDetail(value) {
+  return text(safeTitleText(value), 8 * 1024).trim();
+}
+
 async function maybeCompactExecution(session, execution, run) {
   if (execution.compacting || execution.compacted || execution.compactionFailed || !isRunCurrent(session, run)) return false;
   const plan = compactionPlan(execution.messages);
@@ -913,6 +985,7 @@ async function maybeCompactExecution(session, execution, run) {
       temperature: 0
     });
     if (!isRunCurrent(session, run)) return false;
+    if (responseReachedOutputLimit(response)) throw new Error(translated('error.compactionSummary'));
     const compactedAt = now();
     const summary = text(response && response.content, MAX_COMPACT_SEGMENT_CHARS).trim();
     const combined = appendRecoverySummary(session.compaction.summary, summary, compactedAt);
@@ -999,14 +1072,16 @@ function finishGoal(session, failed = false) {
   for (const step of session.goal.steps) step.status = failed ? (step.status === 'in-progress' ? 'blocked' : step.status) : 'completed';
 }
 
-async function loadSkillContext(session) {
+async function loadSkillContext(session, run) {
+  const owner = runtime;
   const sections = [];
   let size = 0;
-  for (const skillId of session.skillIds.filter((candidate) => runtime.skills.some((skill) => skill.id === candidate))) {
+  for (const skillId of session.skillIds.filter((candidate) => owner.skills.some((skill) => skill.id === candidate))) {
     if (size >= MAX_SKILL_CONTEXT) break;
-    const metadata = runtime.skills.find((skill) => skill.id === skillId);
+    const metadata = owner.skills.find((skill) => skill.id === skillId);
     try {
-      const skill = await runtime.context.skills.read(skillId);
+      const skill = await owner.context.skills.read(skillId);
+      if (runtime !== owner || !isRunCurrent(session, run)) return '';
       const body = text(skill && skill.content, Math.min(64 * 1024, MAX_SKILL_CONTEXT - size));
       if (!body) continue;
       const name = text(skill.name || metadata && metadata.name, 160) || skillId;
@@ -1015,6 +1090,7 @@ async function loadSkillContext(session) {
       size += section.length;
       appendTimeline(session, makeTimeline('skill', 'timeline.skillLoaded', '', 'completed', { name }));
     } catch (error) {
+      if (runtime !== owner || !isRunCurrent(session, run)) return '';
       appendTimeline(session, makeTimeline('error', 'timeline.skillFailed', errorMessage(error), 'failed', {
         name: metadata && metadata.name || skillId
       }));
@@ -1024,11 +1100,18 @@ async function loadSkillContext(session) {
 }
 
 function normalizeToolCalls(value) {
-  return Array.isArray(value) ? value.slice(0, 16).map((call) => ({
-    id: validId(call && call.id) ? call.id : id('call'),
-    name: text(call && call.name, 96),
-    arguments: text(call && call.arguments, 256 * 1024) || '{}'
-  })).filter((call) => /^[A-Za-z][A-Za-z0-9_-]{0,95}$/.test(call.name)) : [];
+  if (!Array.isArray(value)) return [];
+  const calls = [];
+  const callIds = new Set();
+  for (const raw of value.slice(0, 16)) {
+    const name = text(raw && raw.name, 96);
+    if (!/^[A-Za-z][A-Za-z0-9_-]{0,95}$/.test(name)) continue;
+    let callId = validId(raw && raw.id) ? raw.id : id('call');
+    while (callIds.has(callId)) callId = id('call');
+    callIds.add(callId);
+    calls.push({ id: callId, name, arguments: text(raw && raw.arguments, 256 * 1024) || '{}' });
+  }
+  return calls;
 }
 
 function parseToolInput(call) {
@@ -1043,11 +1126,60 @@ function wireToolCall(call) {
   return { id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments } };
 }
 
-function resultForModel(value) {
+function resultForModel(value, maximum = MAX_TOOL_RESULT_CHARS) {
   let serialized;
   try { serialized = JSON.stringify(value); } catch (_) { serialized = JSON.stringify({ error: 'Tool result could not be serialized.' }); }
-  if (serialized.length > 96 * 1024) serialized = serialized.slice(0, 96 * 1024) + '\n[tool result truncated]';
-  return serialized;
+  if (typeof serialized !== 'string') serialized = 'null';
+  const limit = Math.max(512, Math.min(MAX_TOOL_RESULT_CHARS, boundedInteger(maximum, MAX_TOOL_RESULT_CHARS)));
+  if (serialized.length <= limit) return serialized;
+  let previewChars = Math.max(32, Math.floor((limit - 256) / 8));
+  let envelope = '';
+  do {
+    envelope = JSON.stringify({
+      truncated: true,
+      originalCharacters: serialized.length,
+      head: serialized.slice(0, previewChars),
+      tail: serialized.slice(-previewChars)
+    });
+    previewChars = Math.floor(previewChars * 0.75);
+  } while (envelope.length > limit && previewChars >= 24);
+  return envelope.length <= limit
+    ? envelope
+    : JSON.stringify({ truncated: true, originalCharacters: serialized.length, error: 'Tool result exceeded the model context budget.' });
+}
+
+function recordToolCall(execution, call) {
+  if (execution.toolResultBudgetExceeded) throw new Error(translated('error.toolResultBudget'));
+  execution.toolCallCount += 1;
+  if (execution.toolCallCount > MAX_TOOL_CALLS_PER_RUN) throw new Error(translated('error.toolCallBudget'));
+  const fingerprint = call.name + '\u0000' + call.arguments;
+  if (execution.lastToolFingerprint === fingerprint) execution.identicalToolCallCount += 1;
+  else {
+    execution.lastToolFingerprint = fingerprint;
+    execution.identicalToolCallCount = 1;
+  }
+  if (execution.identicalToolCallCount > MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS) {
+    throw new Error(translated('error.repeatedToolCall'));
+  }
+}
+
+function resultForExecution(execution, value) {
+  const remaining = MAX_TOOL_RESULT_CHARS_PER_RUN - execution.toolResultCharacters;
+  if (remaining < 512) {
+    execution.toolResultBudgetExceeded = true;
+    const result = JSON.stringify({ truncated: true, error: 'The cumulative tool result budget was exhausted.' });
+    execution.toolResultCharacters += result.length;
+    return result;
+  }
+  const result = resultForModel(value, Math.min(MAX_TOOL_RESULT_CHARS, remaining));
+  execution.toolResultCharacters += result.length;
+  if (MAX_TOOL_RESULT_CHARS_PER_RUN - execution.toolResultCharacters < 512) execution.toolResultBudgetExceeded = true;
+  return result;
+}
+
+function toolResultSucceeded(tool, result) {
+  if (tool !== 'process_run') return true;
+  return plain(result) && result.cancelled !== true && result.timedOut !== true && result.exitCode === 0;
 }
 
 function toolResultDetail(tool, result) {
@@ -1067,6 +1199,7 @@ async function handleToolCalls(session, execution, calls, run) {
   for (let index = 0; index < calls.length; index += 1) {
     if (!isRunCurrent(session, run)) return { stopped: true };
     const call = calls[index];
+    recordToolCall(execution, call);
     const input = parseToolInput(call);
     const timeline = appendTimeline(session, makeTimeline('tool', 'timeline.toolRunning', '', 'running', { tool: call.name }));
     updateGoalForTool(session, call.name, false);
@@ -1074,8 +1207,10 @@ async function handleToolCalls(session, execution, calls, run) {
     if (!input) {
       timeline.status = 'failed';
       timeline.detail = translated('error.invalidToolArguments');
-      execution.messages.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: resultForModel({ error: timeline.detail }) });
-      continue;
+      execution.unresolvedToolFailure = true;
+      execution.messages.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: resultForExecution(execution, { error: timeline.detail }) });
+      publishAndPersist();
+      return { waiting: false, shortCircuited: true };
     }
     try {
       const result = await runtime.context.tools.invoke(call.name, input);
@@ -1097,17 +1232,22 @@ async function handleToolCalls(session, execution, calls, run) {
         publishAndPersist();
         return { waiting: true };
       }
-      timeline.status = 'completed';
+      const succeeded = toolResultSucceeded(call.name, result);
+      execution.unresolvedToolFailure = !succeeded;
+      timeline.status = succeeded ? 'completed' : 'failed';
       timeline.detail = toolResultDetail(call.name, result);
-      updateGoalForTool(session, call.name, true);
-      execution.messages.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: resultForModel(result) });
+      updateGoalForTool(session, call.name, succeeded);
+      execution.messages.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: resultForExecution(execution, result) });
       publishAndPersist();
+      if (!succeeded) return { waiting: false, shortCircuited: true };
     } catch (error) {
       if (!isRunCurrent(session, run)) return { stopped: true };
       timeline.status = 'failed';
       timeline.detail = errorMessage(error);
-      execution.messages.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: resultForModel({ error: timeline.detail }) });
+      execution.unresolvedToolFailure = true;
+      execution.messages.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: resultForExecution(execution, { error: timeline.detail }) });
       publishAndPersist();
+      return { waiting: false, shortCircuited: true };
     }
   }
   return { waiting: false };
@@ -1124,6 +1264,7 @@ async function runLoop(session, execution, run, initialCalls = []) {
       if (!isRunCurrent(session, run)) return;
       execution.round += 1;
       run.activeRequestId = execution.requestId;
+      const modelStartedAt = Date.now();
       const response = await runtime.context.models.generate({
         requestId: execution.requestId,
         modelRef: session.modelRef,
@@ -1137,13 +1278,14 @@ async function runLoop(session, execution, run, initialCalls = []) {
       const calls = normalizeToolCalls(response && response.toolCalls);
       const content = text(response && response.content);
       const reasoning = text(response && response.reasoning);
-      if (reasoning) appendTimeline(session, makeTimeline('thought', 'timeline.thought', reasoning, 'completed'));
+      if (reasoning) appendTimeline(session, makeTimeline('thought', 'timeline.thought', thoughtDetail(reasoning), 'completed', { seconds: thoughtSeconds(modelStartedAt) }));
       const assistantMessage = content ? appendMessage(session, 'assistant', content) : null;
+      if (responseReachedOutputLimit(response)) throw new Error(translated('error.outputLimit'));
       if (!calls.length) {
         if (!content) appendMessage(session, 'assistant', translated('message.emptyResponse'));
         session.status = 'completed';
         session.updatedAt = now();
-        finishGoal(session, execution.rejected === true);
+        finishGoal(session, execution.rejected === true || execution.unresolvedToolFailure === true);
         runtime.runs.delete(session.id);
         publishAndPersist();
         return;
@@ -1171,31 +1313,48 @@ async function runLoop(session, execution, run, initialCalls = []) {
 }
 
 async function beginRun(session) {
-  const model = modelFor(session);
-  if (!model) {
-    session.status = 'failed';
-    appendTimeline(session, makeTimeline('error', 'timeline.failed', translated('error.modelUnconfigured'), 'failed'));
-    finishGoal(session, true);
+  let run = null;
+  try {
+    const model = modelFor(session);
+    if (!model) {
+      session.status = 'failed';
+      appendTimeline(session, makeTimeline('error', 'timeline.failed', translated('error.modelUnconfigured'), 'failed'));
+      finishGoal(session, true);
+      publishAndPersist();
+      return;
+    }
+    session.modelRef = model.ref;
+    const requestId = id('request');
+    run = { requestId, activeRequestId: requestId, cancelled: false };
+    runtime.runs.set(session.id, run);
+    const skillContext = await loadSkillContext(session, run);
+    if (!isRunCurrent(session, run)) return;
+    const execution = {
+      requestId,
+      round: 0,
+      skillContext,
+      compacting: false,
+      compacted: false,
+      compactionFailed: false,
+      toolCallCount: 0,
+      toolResultCharacters: 0,
+      toolResultBudgetExceeded: false,
+      lastToolFingerprint: '',
+      identicalToolCallCount: 0,
+      unresolvedToolFailure: false,
+      messages: wireMessages(session, systemPrompt(session, skillContext))
+    };
     publishAndPersist();
-    return;
+    await runLoop(session, execution, run);
+  } catch (error) {
+    if (!runtime || runtime.disposed || run && (run.cancelled || runtime.runs.get(session.id) !== run)) return;
+    session.status = 'failed';
+    session.updatedAt = now();
+    appendTimeline(session, makeTimeline('error', 'timeline.failed', errorMessage(error), 'failed'));
+    finishGoal(session, true);
+    if (run) runtime.runs.delete(session.id);
+    publishAndPersist();
   }
-  session.modelRef = model.ref;
-  const requestId = id('request');
-  const run = { requestId, activeRequestId: requestId, cancelled: false };
-  runtime.runs.set(session.id, run);
-  const skillContext = await loadSkillContext(session);
-  if (!isRunCurrent(session, run)) return;
-  const execution = {
-    requestId,
-    round: 0,
-    skillContext,
-    compacting: false,
-    compacted: false,
-    compactionFailed: false,
-    messages: wireMessages(session, systemPrompt(session, skillContext))
-  };
-  publishAndPersist();
-  await runLoop(session, execution, run);
 }
 
 function handleCreate(values) {
@@ -1264,11 +1423,11 @@ async function refineSessionTitle(session, prompt, fallback) {
       temperature: 0
     });
     if (runtime !== owner || owner.disposed || owner.titleRuns.get(session.id) !== titleRun || !owner.sessions.includes(session)) return;
+    if (responseReachedOutputLimit(response)) return;
     const next = generatedSessionTitle(response && response.content, fallback);
     if (next && next !== session.title) {
       session.title = next;
-      void persist().catch(() => {});
-      void publish();
+      publishAndPersist(owner);
     }
   } catch (_) {
     // The deterministic title remains usable when title generation is unavailable.
@@ -1350,9 +1509,10 @@ async function resumeApproval(session, pending, approvalResult, approved) {
   const timeline = session.timeline.find((item) => item.id === pending.timelineId);
   try {
     if (!isRunCurrent(session, run)) return;
-    const operationCompleted = approved && approvalResult.cancelled !== true;
+    const operationCompleted = approved && approvalResult.cancelled !== true && approvalResult.timedOut !== true &&
+      toolResultSucceeded(pending.call.name, approvalResult);
     if (timeline) {
-      timeline.status = operationCompleted ? 'completed' : 'rejected';
+      timeline.status = operationCompleted ? 'completed' : (!approved || approvalResult.cancelled === true ? 'rejected' : 'failed');
       timeline.detail = approved ? toolResultDetail(pending.call.name, approvalResult) : translated('tool.result.rejected');
     }
     updateGoalForTool(session, pending.call.name, operationCompleted);
@@ -1360,13 +1520,13 @@ async function resumeApproval(session, pending, approvalResult, approved) {
       role: 'tool',
       tool_call_id: pending.call.id,
       name: pending.call.name,
-      content: resultForModel(approved ? approvalResult : { ...approvalResult, reason: 'The user rejected this tool operation.' })
+      content: resultForExecution(execution, approved ? approvalResult : { ...approvalResult, reason: 'The user rejected this tool operation.' })
     });
     if (!operationCompleted) execution.rejected = true;
     session.status = 'running';
     session.updatedAt = now();
     publishAndPersist();
-    await runLoop(session, execution, run, pending.remaining);
+    await runLoop(session, execution, run, operationCompleted ? pending.remaining : []);
   } catch (error) {
     if (!runtime || runtime.disposed || run.cancelled) return;
     if (timeline) {
@@ -1399,35 +1559,45 @@ function handleApproval(values, approved) {
   return { accepted: true };
 }
 
-async function refreshCatalogs() {
-  runtime.catalogError = '';
+async function refreshCatalogs(owner = runtime) {
+  if (!owner || runtime !== owner || owner.disposed) return false;
+  const sequence = ++owner.catalogSequence;
+  owner.catalogError = '';
   const [modelsOutcome, skillsOutcome] = await Promise.allSettled([
-    runtime.context.models.list(),
-    runtime.context.skills.list()
+    owner.context.models.list(),
+    owner.context.skills.list()
   ]);
+  if (runtime !== owner || owner.disposed || owner.catalogSequence !== sequence) return false;
   if (modelsOutcome.status === 'fulfilled') {
     const modelsResult = modelsOutcome.value;
-    runtime.models = Array.isArray(modelsResult && modelsResult.models) ? modelsResult.models.filter((model) => plain(model) && validId(model.ref)) : [];
-    if (!runtime.preferences.modelRef || !runtime.models.some((model) => model.ref === runtime.preferences.modelRef && model.configured)) {
-      const preferred = runtime.models.find((model) => model.configured && model.purpose === 'chat') || runtime.models.find((model) => model.configured);
-      runtime.preferences.modelRef = preferred && preferred.ref || '';
+    owner.models = Array.isArray(modelsResult && modelsResult.models)
+      ? uniqueLatest(modelsResult.models.filter((model) => plain(model) && validId(model.ref)), (model) => model.ref)
+      : [];
+    if (!owner.preferences.modelRef || !owner.models.some((model) => model.ref === owner.preferences.modelRef && model.configured)) {
+      const preferred = owner.models.find((model) => model.configured && model.purpose === 'chat') || owner.models.find((model) => model.configured);
+      owner.preferences.modelRef = preferred && preferred.ref || '';
     }
   } else {
-    runtime.models = [];
-    runtime.catalogError = errorMessage(modelsOutcome.reason);
+    owner.models = [];
+    owner.catalogError = errorMessage(modelsOutcome.reason);
   }
   if (skillsOutcome.status === 'fulfilled') {
     const skillsResult = skillsOutcome.value;
-    runtime.skills = Array.isArray(skillsResult && skillsResult.skills) ? skillsResult.skills.filter((skill) => plain(skill) && validId(skill.id)) : [];
-  } else runtime.skills = [];
+    owner.skills = Array.isArray(skillsResult && skillsResult.skills)
+      ? uniqueLatest(skillsResult.skills.filter((skill) => plain(skill) && validId(skill.id)), (skill) => skill.id)
+      : [];
+  } else owner.skills = [];
+  return true;
 }
 
 function handleConfigure() {
-  void refreshCatalogs().then(() => {
-    const session = activeSession();
-    if (session && !modelFor(session)) session.modelRef = runtime.preferences.modelRef;
-    publishAndPersist();
-  });
+  const owner = runtime;
+  void refreshCatalogs(owner).then((refreshed) => {
+    if (!refreshed || runtime !== owner || owner.disposed) return;
+    const session = activeSession(owner);
+    if (session && !modelFor(session)) session.modelRef = owner.preferences.modelRef;
+    publishAndPersist(owner);
+  }).catch(() => {});
   return { accepted: true };
 }
 
@@ -1435,7 +1605,8 @@ function commandMetadata(key) {
   return { title: translated(key), category: translated('command.category') };
 }
 
-async function registerSurface() {
+async function registerSurface(owner = runtime) {
+  if (!owner || runtime !== owner || owner.disposed) return false;
   const handlers = [
     ['create', handleCreate, 'command.create'],
     ['select', handleSelect, 'command.select'],
@@ -1448,43 +1619,64 @@ async function registerSurface() {
     ['configure', handleConfigure, 'command.configure']
   ];
   const disposables = [];
-  for (const [name, handler, titleKey] of handlers) {
-    disposables.push(await runtime.context.commands.register(COMMANDS[name], handler, commandMetadata(titleKey)));
-  }
-  const provider = await runtime.context.agents.register({
-    id: PROVIDER_ID,
-    title: translated('agent.title'),
-    description: translated('agent.description'),
-    icon: 'sparkles',
-    order: 10,
-    commands: { ...COMMANDS },
-    capabilities: {
-      modes: ['chat', 'goal'],
-      reasoningEfforts: [...REASONING_EFFORTS],
-      accessModes: [...ACCESS_MODES],
-      skills: true,
-      localTools: true
+  let provider = null;
+  try {
+    for (const [name, handler, titleKey] of handlers) {
+      const disposable = await owner.context.commands.register(COMMANDS[name], handler, commandMetadata(titleKey));
+      if (runtime !== owner || owner.disposed) {
+        disposable.dispose();
+        for (const item of disposables.reverse()) item.dispose();
+        return false;
+      }
+      disposables.push(disposable);
     }
-  });
-  runtime.surface = disposables;
-  runtime.provider = provider;
+    provider = await owner.context.agents.register({
+      id: PROVIDER_ID,
+      title: translated('agent.title'),
+      description: translated('agent.description'),
+      icon: 'sparkles',
+      order: 10,
+      commands: { ...COMMANDS },
+      capabilities: {
+        modes: ['chat', 'goal'],
+        reasoningEfforts: [...REASONING_EFFORTS],
+        accessModes: [...ACCESS_MODES],
+        skills: true,
+        localTools: true
+      }
+    });
+    if (runtime !== owner || owner.disposed) {
+      provider.dispose();
+      for (const item of disposables.reverse()) item.dispose();
+      return false;
+    }
+    owner.surface = disposables;
+    owner.provider = provider;
+    return true;
+  } catch (error) {
+    if (provider) { try { provider.dispose(); } catch (_) {} }
+    for (const item of disposables.reverse()) { try { item.dispose(); } catch (_) {} }
+    if (runtime === owner && !owner.disposed) throw error;
+    return false;
+  }
 }
 
-function disposeSurface() {
-  if (!runtime) return;
-  if (runtime.provider) runtime.provider.dispose();
-  runtime.provider = null;
-  for (const disposable of runtime.surface.splice(0).reverse()) disposable.dispose();
+function disposeSurface(owner = runtime) {
+  if (!owner) return;
+  if (owner.provider) { try { owner.provider.dispose(); } catch (_) {} }
+  owner.provider = null;
+  for (const disposable of owner.surface.splice(0).reverse()) { try { disposable.dispose(); } catch (_) {} }
 }
 
-function rebuildSurface() {
-  if (!runtime || runtime.disposed) return;
-  runtime.surfaceQueue = runtime.surfaceQueue.catch(() => {}).then(async () => {
-    if (!runtime || runtime.disposed) return;
-    disposeSurface();
-    await registerSurface();
-    await publish();
+function rebuildSurface(owner = runtime) {
+  if (!owner || runtime !== owner || owner.disposed) return Promise.resolve();
+  owner.surfaceQueue = owner.surfaceQueue.catch(() => {}).then(async () => {
+    if (runtime !== owner || owner.disposed) return;
+    disposeSurface(owner);
+    const registered = await registerSurface(owner);
+    if (registered) await publish(owner);
   });
+  return owner.surfaceQueue;
 }
 
 export async function activate(context) {
@@ -1506,23 +1698,38 @@ export async function activate(context) {
     surface: [],
     localeSubscription: null,
     catalogError: '',
+    catalogSequence: 0,
     disposed: false,
     publishQueue: Promise.resolve(),
+    publishWriter: null,
+    pendingPublish: null,
     storageQueue: Promise.resolve(),
+    storageWriter: null,
+    pendingStorageValue: null,
     surfaceQueue: Promise.resolve()
   };
-  await refreshCatalogs();
-  await registerSurface();
-  runtime.localeSubscription = context.i18n.onDidChange(() => rebuildSurface());
-  context.subscriptions.add(runtime.localeSubscription);
-  await publish();
-  void persist().catch(() => {});
-  return { dispose: deactivate };
+  const owner = runtime;
+  try {
+    await refreshCatalogs(owner);
+    if (!await registerSurface(owner)) throw new Error('Agent surface activation was cancelled.');
+    owner.localeSubscription = context.i18n.onDidChange(() => rebuildSurface(owner));
+    context.subscriptions.add(owner.localeSubscription);
+    void persist(owner).catch(() => {});
+    await publish(owner);
+    return { dispose: deactivate };
+  } catch (error) {
+    owner.disposed = true;
+    if (owner.localeSubscription) { try { owner.localeSubscription.dispose(); } catch (_) {} }
+    disposeSurface(owner);
+    if (runtime === owner) runtime = null;
+    throw error;
+  }
 }
 
 export async function deactivate() {
   const current = runtime;
   if (!current) return;
+  const finalState = boundedPersistedState(current);
   current.disposed = true;
   for (const run of current.runs.values()) {
     run.cancelled = true;
@@ -1535,9 +1742,13 @@ export async function deactivate() {
   current.titleRuns.clear();
   current.pending.clear();
   current.compacting.clear();
-  if (current.localeSubscription) current.localeSubscription.dispose();
-  disposeSurface();
-  runtime = null;
+  if (current.localeSubscription) { try { current.localeSubscription.dispose(); } catch (_) {} }
+  disposeSurface(current);
+  current.pendingPublish = null;
+  current.pendingStorageValue = null;
+  if (runtime === current) runtime = null;
+  if (current.storageWriter) await current.storageWriter.catch(() => {});
+  await current.context.storage.write(finalState).catch(() => {});
 }
 
 export const __testing = Object.freeze({
@@ -1548,6 +1759,7 @@ export const __testing = Object.freeze({
   storageSchemaVersion: STORAGE_SCHEMA_VERSION,
   maxSessionTitleUnits: MAX_SESSION_TITLE_UNITS,
   maxSessionTitleCodeUnits: MAX_SESSION_TITLE_CODE_UNITS,
+  maxToolResultChars: MAX_TOOL_RESULT_CHARS,
   titleUnits,
   summarizeSessionTitle,
   shouldRefineSessionTitle,
@@ -1555,5 +1767,8 @@ export const __testing = Object.freeze({
   estimateMessagesTokens,
   compactionPlan,
   modelMessages,
+  resultForModel,
+  responseReachedOutputLimit,
+  toolResultSucceeded,
   getState: () => runtime ? stateSnapshot() : null
 });

@@ -61,9 +61,13 @@ sessions[]
 
 At most 100 sessions, 200 messages per session, and 240 timeline items per session are retained. The host separately validates every state snapshot before rendering it.
 
+State publication and storage use latest-snapshot coalescing: while one host write is pending, newer snapshots replace queued obsolete snapshots instead of creating an unbounded write backlog. Shutdown rejects late model/catalog/surface results, disposes registrations that finish after deactivation, waits for an active storage write, and then writes one final bounded state snapshot. Persistence-budget pruning happens before publication so the rendered and durable session catalogs stay consistent.
+
 Approval ids and in-flight model/tool execution state are deliberately memory-only. The Agent state sent from the Worker contains only `{ id }`; the workbench resolves all approval details from the canonical main-process broker. On activation, a persisted `running` or `waiting-approval` session becomes `cancelled`; stale approval state is never replayed after restart.
 
 The public active-session snapshot exposes `compacting` plus bounded compaction metrics: `count`, `compactedMessages`, `estimatedTokensBefore`, `estimatedTokensAfter`, and `compactedAt`. The recovery summary itself never enters renderer state. It remains in plugin-local storage and is injected only into model context as lower-priority, untrusted background.
+
+Provider reasoning text is never persisted. During the active process lifetime, a response may publish a control-character-sanitized thought summary capped at 8 KiB plus a localized duration; every storage snapshot clears that detail. Loading older schema-1 or schema-2 state removes stored message/timeline reasoning and re-sanitizes session titles before the host sees them.
 
 ## Run State Machine
 
@@ -84,6 +88,8 @@ waiting-approval
 ```
 
 One run keeps one plugin-generated primary `requestId` across normal model rounds. A compaction request gets a separate plugin-generated id, never receives tools, and temporarily becomes the active cancellable request. Cancel calls `context.models.cancel(activeRequestId)` and discards late results through an in-memory run token. Pending approval cancellation only clears plugin orchestration state; process-tree cancellation belongs to the trusted workbench and main-process broker.
+
+A run is capped at 64 tool calls, three consecutive identical calls, 96 KiB per model-facing tool result, and 512 KiB of cumulative model-facing tool results. Oversized results remain valid JSON with bounded head/tail previews. Invalid arguments, invocation errors, non-zero process exits, timeouts, cancellations, and rejected approvals stop the remaining sibling calls from that model turn so the model must observe the result and replan. Model finish reasons that indicate an output limit preserve partial text but fail the run instead of reporting false completion.
 
 ## Goal and Reasoning Modes
 
@@ -118,6 +124,12 @@ Read-only tools execute immediately. `workspace_write` and `process_run` return 
 The Worker-facing `context.tools` surface contains only `invoke(tool, input)`. There are no Worker methods for approve, reject, or cancel, so downloaded code cannot redeem or control an approval capability directly.
 
 The plugin checks that the returned action, approval id, optional tool name, and result disposition match its pending call, then adds that trusted result as the model's tool message and resumes the same run. The host remains responsible for path normalization, workspace identity checks, symlink containment, write conflict hashes, process allowlists, `shell: false`, timeouts, output bounds, process-tree cancellation, result sanitization, and invalidating approvals on workspace or plugin lifecycle changes.
+
+Catalog refreshes carry a monotonically increasing local sequence so an older model/Skill query cannot overwrite a newer result. Locale-triggered surface rebuilds capture their runtime owner; partial or late command/provider registrations are disposed if the plugin is replaced or deactivated before registration finishes.
+
+## Package Verification
+
+The deterministic package verifier compares the current archive with the workspace manifest and every packaged file, verifies the checksum filename and digest, and requires the reviewed permission/localization/integrity sets exactly. ZIP parsing rejects duplicate or escaping paths, unsupported flags or compression, inconsistent local/central metadata, oversized entries, malformed lengths, CRC mismatches, and decompression beyond the package limit.
 
 ## Cross-Platform Strategy
 

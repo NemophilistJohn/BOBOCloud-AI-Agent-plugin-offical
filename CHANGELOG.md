@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.3.1 - 2026-08-31
+
+- Stop rejected, cancelled, timed-out, or failed tool operations from executing stale sibling calls.
+- Add bounded tool-call, repeated-call, and cumulative-result circuit breakers while preserving valid JSON results.
+- Coalesce host state and storage snapshots, reject stale catalog refreshes, and clean late surface registrations during shutdown.
+- Keep provider reasoning out of durable storage while exposing only a sanitized, bounded in-session thought summary and duration.
+- Treat model output-limit finishes as incomplete runs and strengthen pre-loop failure recovery.
+- Harden archive and checksum verification against duplicate entries, traversal, inconsistent ZIP metadata, stale workspace bytes, and mismatched release files.
+
 ## 1.3.0 - 2026-08-25
 
 - Summarize the first request into a Unicode-safe, width-bounded session title, with optional low-cost model refinement and deterministic fallback.

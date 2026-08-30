@@ -23,6 +23,11 @@ function harness(options = {}) {
   const writes = [];
   const subscriptions = [];
   let descriptor = null;
+  let modelListCalls = 0;
+  let skillListCalls = 0;
+  let storageWriteCalls = 0;
+  let commandRegisterCalls = 0;
+  let stateWriteCalls = 0;
   const modelResponses = [...(options.modelResponses || [{ content: 'Done.', toolCalls: [] }])];
   const context = {
     subscriptions: {
@@ -30,6 +35,8 @@ function harness(options = {}) {
     },
     commands: {
       async register(commandId, handler, metadata) {
+        commandRegisterCalls += 1;
+        if (typeof options.registerCommand === 'function') await options.registerCommand(commandId, commandRegisterCalls);
         const record = { handler, metadata };
         commands.set(commandId, record);
         return { dispose() { if (commands.get(commandId) === record) commands.delete(commandId); } };
@@ -41,7 +48,12 @@ function harness(options = {}) {
         let active = true;
         return {
           id: value.id,
-          async setState(state) { if (active) states.push(structuredClone(state)); },
+          async setState(state) {
+            if (!active) return;
+            stateWriteCalls += 1;
+            states.push(structuredClone(state));
+            if (typeof options.stateWrite === 'function') await options.stateWrite(state, stateWriteCalls);
+          },
           clearState() {},
           dispose() { active = false; }
         };
@@ -49,6 +61,8 @@ function harness(options = {}) {
     },
     models: {
       async list() {
+        modelListCalls += 1;
+        if (typeof options.modelsList === 'function') return options.modelsList(modelListCalls);
         return { models: [{ ref: 'chat:test', purpose: 'chat', name: 'Test', provider: 'test', modelId: 'test-1', configured: true }] };
       },
       async generate(args) {
@@ -73,16 +87,24 @@ function harness(options = {}) {
     },
     skills: {
       async list() {
+        skillListCalls += 1;
+        if (typeof options.skillsList === 'function') return options.skillsList(skillListCalls);
         return { skills: [{ id: 'skill-test', name: 'Test Skill', description: 'Testing instructions', source: 'workspace' }] };
       },
       async read(skillId) {
         assert.equal(skillId, 'skill-test');
+        if (typeof options.skillRead === 'function') return options.skillRead(skillId);
         return { id: skillId, name: 'Test Skill', description: 'Testing instructions', source: 'workspace', content: 'Always inspect the target before editing.' };
       }
     },
     storage: {
       async read() { return { value: options.stored || {} }; },
-      async write(value) { writes.push(structuredClone(value)); return { saved: true }; }
+      async write(value) {
+        storageWriteCalls += 1;
+        writes.push(structuredClone(value));
+        if (typeof options.storageWrite === 'function') return options.storageWrite(value, storageWriteCalls);
+        return { saved: true };
+      }
     },
     i18n: {
       locale: 'en',
@@ -208,6 +230,13 @@ async function waitFor(predicate, message) {
   throw new Error(message || 'Timed out waiting for Agent state.');
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => { resolve = onResolve; reject = onReject; });
+  return { promise, resolve, reject };
+}
+
 test('registers a host-rendered Agent and completes a goal with Skill-guided tool use', async () => {
   await deactivate();
   const host = harness({
@@ -248,6 +277,10 @@ test('registers a host-rendered Agent and completes a goal with Skill-guided too
   assert.equal(host.modelCalls[0].requestId, host.modelCalls[1].requestId, 'one run must keep one cancellable request id');
   assert.match(host.modelCalls[0].messages[0].content, /Always inspect the target before editing/);
   assert.equal(completed.activeSession.timeline.some((item) => item.kind === 'skill'), true);
+  const thought = completed.activeSession.timeline.find((item) => item.kind === 'thought');
+  assert.match(thought.detail, /inspect the requested file first/);
+  assert.match(thought.title, /^Thought for \d+s$/);
+  assert.equal(JSON.stringify(host.writes).includes('I should inspect the requested file first.'), false);
   assert.equal(host.writes.length > 0, true);
   await deactivate();
 });
@@ -656,4 +689,301 @@ test('treats a host-cancelled approved process as a blocked goal result', async 
   assert.equal(completed.activeSession.goal.status, 'blocked');
   assert.equal(completed.activeSession.timeline.some((item) => item.kind === 'tool' && item.status === 'rejected'), true);
   await deactivate();
+});
+
+test('serializes every tool result as bounded valid JSON', () => {
+  const encoded = __testing.resultForModel({ stdout: 'x'.repeat(__testing.maxToolResultChars * 2), stderr: 'tail-marker' });
+  assert.equal(encoded.length <= __testing.maxToolResultChars, true);
+  const parsed = JSON.parse(encoded);
+  assert.equal(parsed.truncated, true);
+  assert.equal(parsed.originalCharacters > __testing.maxToolResultChars, true);
+  assert.match(parsed.tail, /tail-marker/);
+  assert.equal(__testing.resultForModel(undefined), 'null');
+  const cyclic = {};
+  cyclic.self = cyclic;
+  assert.match(JSON.parse(__testing.resultForModel(cyclic)).error, /could not be serialized/i);
+});
+
+test('rewrites duplicate model tool-call ids before returning results', async () => {
+  await deactivate();
+  const host = harness({
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [
+          { id: 'duplicate-call', name: 'workspace_read', arguments: JSON.stringify({ path: 'src/a.js' }) },
+          { id: 'duplicate-call', name: 'workspace_read', arguments: JSON.stringify({ path: 'src/b.js' }) }
+        ]
+      },
+      { content: 'Both files were read.', toolCalls: [] }
+    ]
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Read both files.', modelRef: 'chat:test' });
+  await waitFor(() => __testing.getState().activeSession?.status === 'completed');
+  const toolMessages = host.modelCalls[1].messages.filter((message) => message.role === 'tool');
+  assert.equal(toolMessages.length, 2);
+  assert.equal(new Set(toolMessages.map((message) => message.tool_call_id)).size, 2);
+  await deactivate();
+});
+
+test('does not execute sibling tool calls after a rejected approval', async () => {
+  await deactivate();
+  const approval = { id: 'approval-stop-siblings', tool: 'workspace_write', summary: 'Write file', risk: 'write', expiresAt: new Date(Date.now() + 60_000).toISOString() };
+  const host = harness({
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [
+          { id: 'call-write-first', name: 'workspace_write', arguments: JSON.stringify({ path: 'src/a.js', content: 'a' }) },
+          { id: 'call-process-second', name: 'process_run', arguments: JSON.stringify({ command: 'npm', args: ['test'] }) }
+        ]
+      },
+      { content: 'The rejected change was not attempted again.', toolCalls: [] }
+    ],
+    invoke(tool) {
+      if (tool === 'workspace_write') return { approvalRequired: true, approval };
+      throw new Error('A sibling tool call must not execute after rejection.');
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Change and test the file.', modelRef: 'chat:test' });
+  await waitFor(() => __testing.getState().activeSession?.status === 'waiting-approval');
+  host.commands.get(__testing.commands.reject).handler({
+    approvalId: approval.id,
+    approvalResult: { rejected: true, tool: 'workspace_write' }
+  });
+  await waitFor(() => __testing.getState().activeSession?.status === 'completed');
+  assert.deepEqual(host.toolCalls.map((call) => call.tool), ['workspace_write']);
+  await deactivate();
+});
+
+test('short-circuits sibling calls when a process fails', async () => {
+  await deactivate();
+  const host = harness({
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [
+          { id: 'call-test-fails', name: 'process_run', arguments: JSON.stringify({ command: 'npm', args: ['test'] }) },
+          { id: 'call-write-after-failure', name: 'workspace_write', arguments: JSON.stringify({ path: 'src/a.js', content: 'a' }) }
+        ]
+      },
+      { content: 'The failing test stopped this action batch.', toolCalls: [] }
+    ],
+    invoke(tool) {
+      if (tool === 'process_run') return { approved: true, exitCode: 1, stdout: '', stderr: 'failed', truncated: false, timedOut: false, cancelled: false };
+      throw new Error('A sibling mutation must not execute after process failure.');
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Test before changing the file.', mode: 'goal', modelRef: 'chat:test' });
+  const completed = await waitFor(() => {
+    const session = __testing.getState().activeSession;
+    return session?.status === 'completed' ? session : null;
+  });
+  assert.deepEqual(host.toolCalls.map((call) => call.tool), ['process_run']);
+  assert.equal(completed.timeline.some((item) => item.kind === 'tool' && item.status === 'failed'), true);
+  assert.equal(completed.goal.status, 'blocked');
+  await deactivate();
+});
+
+test('stops a run that repeats an identical tool call without progress', async () => {
+  await deactivate();
+  const repeated = (index) => ({
+    content: '',
+    toolCalls: [{ id: 'call-repeat-' + index, name: 'workspace_read', arguments: JSON.stringify({ path: 'src/repeat.js' }) }]
+  });
+  const host = harness({ modelResponses: [repeated(1), repeated(2), repeated(3), repeated(4)] });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Inspect the repeated file.', modelRef: 'chat:test' });
+  const failed = await waitFor(() => {
+    const session = __testing.getState().activeSession;
+    return session?.status === 'failed' ? session : null;
+  });
+  assert.equal(host.toolCalls.length, 3);
+  assert.equal(failed.timeline.some((item) => item.kind === 'error' && /repeating the same tool call/i.test(item.detail)), true);
+  await deactivate();
+});
+
+test('keeps partial output but fails a response that reaches the model limit', async () => {
+  await deactivate();
+  const host = harness({ modelResponses: [{ content: 'Partial answer', finishReason: 'length', toolCalls: [] }] });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Summarize', modelRef: 'chat:test' });
+  const failed = await waitFor(() => {
+    const session = __testing.getState().activeSession;
+    return session?.status === 'failed' ? session : null;
+  });
+  assert.equal(failed.messages.at(-1).content, 'Partial answer');
+  assert.equal(failed.timeline.some((item) => item.kind === 'error' && /output limit/i.test(item.detail)), true);
+  await deactivate();
+});
+
+test('coalesces queued storage snapshots and persists the latest state', async () => {
+  await deactivate();
+  const gate = deferred();
+  const host = harness({ storageWrite(_value, call) { return call === 2 ? gate.promise : { saved: true }; } });
+  await activate(host.context);
+  host.commands.get(__testing.commands.create).handler({ modelRef: 'chat:test' });
+  await waitFor(() => host.writes.length >= 2);
+  for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+    host.commands.get(__testing.commands.preferences).handler({ reasoningEffort: effort });
+  }
+  gate.resolve({ saved: true });
+  await waitFor(() => host.writes.at(-1)?.preferences?.reasoningEffort === 'max');
+  assert.equal(host.writes.length <= 3, true, 'queued writes should collapse to the newest snapshot');
+  await deactivate();
+});
+
+test('coalesces queued host state publications', async () => {
+  await deactivate();
+  const gate = deferred();
+  const host = harness({ stateWrite(_value, call) { return call === 2 ? gate.promise : undefined; } });
+  await activate(host.context);
+  host.commands.get(__testing.commands.create).handler({ modelRef: 'chat:test' });
+  await waitFor(() => host.states.length >= 2);
+  for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+    host.commands.get(__testing.commands.preferences).handler({ reasoningEffort: effort });
+  }
+  gate.resolve();
+  await waitFor(() => host.states.at(-1)?.activeSession?.reasoningEffort === 'max');
+  assert.equal(host.states.length <= 3, true, 'queued publications should collapse to the newest snapshot');
+  await deactivate();
+});
+
+test('ignores stale catalog refreshes that finish out of order', async () => {
+  await deactivate();
+  const slow = deferred();
+  const model = (id) => ({ ref: 'chat:' + id, purpose: 'chat', name: id, provider: 'test', modelId: id, configured: true });
+  const host = harness({
+    modelsList(call) {
+      if (call === 1) return { models: [model('initial')] };
+      if (call === 2) return slow.promise;
+      return { models: [model('latest')] };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.configure).handler({});
+  host.commands.get(__testing.commands.configure).handler({});
+  await waitFor(() => __testing.getState().models.some((item) => item.ref === 'chat:latest'));
+  slow.resolve({ models: [model('stale')] });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(__testing.getState().models.map((item) => item.ref), ['chat:latest']);
+  await deactivate();
+});
+
+test('cancels a pending title refinement during deactivation', async () => {
+  await deactivate();
+  const title = deferred();
+  const host = harness({
+    modelResponses: [{ content: 'Done.', toolCalls: [] }],
+    titleResponse() { return title.promise; }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({
+    text: 'Analyze a long request with several clauses, validate the result, and produce a concise report.',
+    modelRef: 'chat:test'
+  });
+  await waitFor(() => host.titleCalls.length === 1);
+  const requestId = host.titleCalls[0].requestId;
+  await deactivate();
+  assert.equal(host.cancellations.includes(requestId), true);
+  title.resolve({ content: 'Late title', toolCalls: [] });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(__testing.getState(), null);
+});
+
+test('rejects late Skill reads after a run is cancelled', async () => {
+  await deactivate();
+  const skill = deferred();
+  let readStarted = false;
+  const host = harness({
+    skillRead() {
+      readStarted = true;
+      return skill.promise;
+    }
+  });
+  await activate(host.context);
+  const sent = host.commands.get(__testing.commands.send).handler({
+    text: 'Use the selected Skill.',
+    modelRef: 'chat:test',
+    skillIds: ['skill-test']
+  });
+  await waitFor(() => readStarted);
+  host.commands.get(__testing.commands.cancel).handler({ sessionId: sent.sessionId });
+  skill.resolve({ id: 'skill-test', name: 'Test Skill', content: 'Late Skill content.' });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const session = __testing.getState().activeSession;
+  assert.equal(session.status, 'cancelled');
+  assert.equal(session.timeline.some((item) => item.kind === 'skill'), false);
+  assert.equal(host.modelCalls.length, 0);
+  await deactivate();
+});
+
+test('sanitizes restored titles and removes persisted raw reasoning', async () => {
+  await deactivate();
+  const stored = storedSession([{ role: 'assistant', content: 'Stored answer' }]);
+  stored.sessions[0].title = '\u202eUnsafe\u200b ' + 'x'.repeat(220);
+  stored.sessions[0].messages[0].reasoning = 'private-message-reasoning';
+  stored.sessions[0].messages.push({ ...stored.sessions[0].messages[0], content: 'Latest duplicate message' });
+  stored.sessions[0].goal = {
+    title: '',
+    status: 'pending',
+    steps: [
+      { id: 'duplicate-step', titleKey: 'goal.step.understand', status: 'completed' },
+      { id: 'duplicate-step', titleKey: 'goal.step.inspect', status: 'pending' }
+    ]
+  };
+  stored.sessions[0].timeline = [{
+    id: 'event-old-thought',
+    kind: 'thought',
+    titleKey: 'timeline.thought',
+    titleValues: { seconds: 3, ignored: { nested: true } },
+    detail: 'private-timeline-reasoning',
+    status: 'completed',
+    createdAt: '2026-08-25T00:00:00.000Z'
+  }];
+  stored.sessions.push(structuredClone(stored.sessions[0]));
+  const host = harness({ stored });
+  await activate(host.context);
+  const session = __testing.getState().activeSession;
+  assert.equal(session.title.includes('\u202e'), false);
+  assert.equal(session.title.includes('\u200b'), false);
+  assert.equal(session.title.length <= __testing.maxSessionTitleCodeUnits, true);
+  assert.equal(__testing.getState().sessions.length, 1);
+  assert.equal(session.messages.length, 1);
+  assert.equal(session.messages[0].content, 'Latest duplicate message');
+  assert.equal(session.messages[0].reasoning, '');
+  assert.equal(session.timeline[0].detail, '');
+  assert.equal(session.goal.title, 'Complete the requested goal');
+  assert.equal(new Set(session.goal.steps.map((step) => step.id)).size, 2);
+  await waitFor(() => host.writes.length > 0);
+  assert.equal(JSON.stringify(host.writes).includes('private-message-reasoning'), false);
+  assert.equal(JSON.stringify(host.writes).includes('private-timeline-reasoning'), false);
+  await deactivate();
+});
+
+test('cleans registrations that finish after deactivation', async () => {
+  await deactivate();
+  const gate = deferred();
+  let lateRegistrationStarted = false;
+  const host = harness({
+    registerCommand(_commandId, call) {
+      if (call === 10) {
+        lateRegistrationStarted = true;
+        return gate.promise;
+      }
+      return undefined;
+    }
+  });
+  await activate(host.context);
+  const localeSubscription = host.subscriptions.find((item) => typeof item.listener === 'function');
+  localeSubscription.listener();
+  await waitFor(() => lateRegistrationStarted);
+  await deactivate();
+  gate.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(host.commands.size, 0);
+  assert.equal(__testing.getState(), null);
 });

@@ -4,7 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { buildPackage, readZip, sha256, verifyPackage } from '../scripts/package.mjs';
+import { buildPackage, createZip, readZip, sha256, verifyPackage } from '../scripts/package.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -16,7 +16,7 @@ test('builds a deterministic schema-1 package with complete integrity coverage',
   assert.deepEqual(secondBytes, firstBytes);
   assert.equal(second.sha256, sha256(secondBytes));
 
-  const verified = await verifyPackage(second.artifactPath);
+  const verified = await verifyPackage(second.artifactPath, { compareWorkspace: true, verifyChecksum: true });
   assert.equal(verified.manifest.id, 'bobocloud.ai-agent');
   assert.equal(verified.manifest.engines.pluginApi, '^1.5.0');
   assert.equal(verified.manifest.engines.bobocloud, '>=2.8.0 <3.0.0');
@@ -31,6 +31,29 @@ test('builds a deterministic schema-1 package with complete integrity coverage',
   assert.equal(entries.has('src/extension.js'), false);
   assert.equal(entries.has('scripts/package.mjs'), false);
   assert.equal(entries.get('dist/extension.js').toString('utf8'), await fs.readFile(path.join(root, 'src', 'extension.js'), 'utf8'));
+});
+
+test('rejects duplicate archive entries and mismatched checksum metadata', async () => {
+  const duplicate = createZip([
+    { name: 'manifest.json', content: Buffer.from('{}') },
+    { name: 'manifest.json', content: Buffer.from('{}') }
+  ]);
+  assert.throws(() => readZip(duplicate), /duplicate entry/i);
+  const traversal = createZip([{ name: '../manifest.json', content: Buffer.from('{}') }]);
+  assert.throws(() => readZip(traversal), /entry path is invalid/i);
+
+  const built = await buildPackage();
+  const checksumPath = built.artifactPath + '.sha256';
+  const originalChecksum = await fs.readFile(checksumPath);
+  try {
+    await fs.writeFile(checksumPath, '0'.repeat(64) + '  ' + path.basename(built.artifactPath) + '\n', 'utf8');
+    await assert.rejects(
+      verifyPackage(built.artifactPath, { compareWorkspace: true, verifyChecksum: true }),
+      /checksum file is invalid/i
+    );
+  } finally {
+    await fs.writeFile(checksumPath, originalChecksum);
+  }
 });
 
 test('ships flat and complete English, Simplified Chinese, and Japanese message catalogs', async () => {
