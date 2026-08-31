@@ -4,7 +4,7 @@ Official local AI Agent plugin for BOBOCLOUD. It adds an Agent workbench as a pe
 
 The plugin is written in plain JavaScript and has no runtime dependencies or native modules. Privileged work remains in BOBOCLOUD's cross-platform host brokers, so one package can run on Windows, macOS, and Linux.
 
-Version `1.3.1` requires BOBOCLOUD `>=2.8.0 <3.0.0` and Plugin API `^1.5.0`.
+Version `1.3.2` requires BOBOCLOUD `>=2.8.1 <3.0.0` and Plugin API `^1.5.0`.
 
 ## Capabilities
 
@@ -21,6 +21,7 @@ Version `1.3.1` requires BOBOCLOUD `>=2.8.0 <3.0.0` and Plugin API `^1.5.0`.
 - Approval-gated allowlisted process execution with structured arguments and no shell.
 - Real model cancellation, with approval execution and process cancellation owned entirely by the trusted host.
 - Progress-aware tool circuit breakers, valid bounded JSON results, and failure-safe sibling-call handling.
+- Terminal recovery when an approved host operation fails after its one-shot approval is consumed.
 - Coalesced state persistence, stale asynchronous-result rejection, and bounded in-session thought summaries that are removed from durable storage.
 - English, Simplified Chinese, and Japanese UI strings.
 
@@ -51,15 +52,15 @@ npm run verify
 `npm run package` copies the self-contained source to `dist/extension.js`, regenerates every manifest integrity hash, and writes a deterministic artifact:
 
 ```text
-artifacts/bobocloud.ai-agent-1.3.1.boboplugin
-artifacts/bobocloud.ai-agent-1.3.1.boboplugin.sha256
+artifacts/bobocloud.ai-agent-1.3.2.boboplugin
+artifacts/bobocloud.ai-agent-1.3.2.boboplugin.sha256
 ```
 
 The archive contains only `manifest.json`, `dist/extension.js`, and the three locale catalogs. Source, tests, scripts, and repository metadata are intentionally excluded.
 
 ## Install
 
-Use BOBOCLOUD's Extensions view to install the `.boboplugin` archive, then enable the plugin. Version `1.3.1` requires BOBOCLOUD `2.8.0` or newer. Configure at least one Chat model in BOBOCLOUD's AI settings. The Agent activity item appears only while the plugin is enabled.
+Use BOBOCLOUD's Extensions view to install the `.boboplugin` archive, then enable the plugin. Version `1.3.2` requires BOBOCLOUD `2.8.1` or newer. Configure at least one Chat model in BOBOCLOUD's AI settings. The Agent activity item appears only while the plugin is enabled.
 
 The Agent does not share conversations with Chat and does not replace inline completion. It only reuses host-owned model connection profiles through opaque model references.
 
@@ -76,13 +77,13 @@ The Agent does not share conversations with Chat and does not replace inline com
 Marketplace artifact URL pattern:
 
 ```text
-https://raw.githubusercontent.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/v1.3.1/artifacts/bobocloud.ai-agent-1.3.1.boboplugin
+https://raw.githubusercontent.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/v1.3.2/artifacts/bobocloud.ai-agent-1.3.2.boboplugin
 ```
 
 The release workflow also publishes the same bytes as a GitHub Release asset:
 
 ```text
-https://github.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/releases/download/v1.3.1/bobocloud.ai-agent-1.3.1.boboplugin
+https://github.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/releases/download/v1.3.2/bobocloud.ai-agent-1.3.2.boboplugin
 ```
 
 ## 中文说明
@@ -91,4 +92,4 @@ https://github.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/releases/do
 
 插件本身不接触 Node.js、Electron、绝对路径、Shell、网络、密钥或原始 IPC。文件写入和进程执行都必须经过 BOBOCLOUD 的显式审批，并由宿主在当前工作区边界内完成。
 
-`1.3.1` 面向 BOBOCLOUD 2.8 / Plugin API 1.5：在保留访问模式、五档思考强度、斜杠模式、上下文压缩和标题提炼的基础上，补齐工具断路、失败短路、状态合并、异步生命周期隔离与发布包校验。访问模式不授予权限，真正的自动批准规则始终由可信宿主掌握。
+`1.3.2` 面向 BOBOCLOUD 2.8.1 / Plugin API 1.5：在保留访问模式、五档思考强度、斜杠模式、上下文压缩和标题提炼的基础上，修复审批已消费但宿主执行失败时会话永久等待的问题，并把该终态作为明确的工具执行失败交还模型。若进程结果不确定，插件会阻止同一轮自动重试并要求先验证实际影响。访问模式不授予权限，真正的自动批准规则始终由可信宿主掌握。

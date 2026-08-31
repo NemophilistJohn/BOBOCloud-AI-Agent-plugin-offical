@@ -648,6 +648,114 @@ test('consumes a trusted rejection result and resumes with a blocked goal', asyn
   await deactivate();
 });
 
+test('consumes an approved host execution failure without reporting a user rejection', async () => {
+  await deactivate();
+  const approval = {
+    id: 'approval-write-conflict',
+    tool: 'workspace_write',
+    summary: 'Replace src/example.js',
+    risk: 'write',
+    expiresAt: new Date(Date.now() + 60_000).toISOString()
+  };
+  const host = harness({
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [{ id: 'call-conflict', name: 'workspace_write', arguments: JSON.stringify({ path: 'src/example.js', content: 'new' }) }]
+      },
+      { content: 'The file changed, so I did not overwrite it.', toolCalls: [] }
+    ],
+    invoke() { return { approvalRequired: true, approval }; }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Update the file.', mode: 'goal', modelRef: 'chat:test' });
+  await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'waiting-approval'));
+  assert.equal(host.commands.get(__testing.commands.reject).handler({
+    approvalId: approval.id,
+    approvalResult: { rejected: true, failed: true, tool: 'workspace_write' }
+  }).accepted, false, 'a failed result without a host error code must not consume plugin state');
+  const resumed = host.commands.get(__testing.commands.reject).handler({
+    approvalId: approval.id,
+    approvalResult: {
+      approved: false,
+      rejected: true,
+      failed: true,
+      tool: 'workspace_write',
+      errorCode: 'AGENT_FILE_CHANGED',
+      errorMessage: 'The file changed while approval was pending.',
+      outcome: 'not-started',
+      mayHaveExecuted: false
+    }
+  });
+  assert.equal(resumed.accepted, true);
+  const completed = await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'completed'));
+  const failedTool = completed.activeSession.timeline.find((item) => item.kind === 'tool');
+  assert.equal(failedTool.status, 'failed');
+  assert.equal(failedTool.detail, 'The file changed after it was read. Read it again before writing.');
+  assert.equal(completed.activeSession.goal.status, 'blocked');
+  const delivered = host.modelCalls[1].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'call-conflict');
+  const result = JSON.parse(delivered.content);
+  assert.equal(result.failed, true);
+  assert.equal(result.errorCode, 'AGENT_FILE_CHANGED');
+  assert.equal(result.outcome, 'not-started');
+  assert.equal(result.mayHaveExecuted, false);
+  assert.equal(Object.hasOwn(result, 'reason'), false);
+  await deactivate();
+});
+
+test('blocks automatic process retries after an unknown approved outcome', async () => {
+  await deactivate();
+  const approval = {
+    id: 'approval-process-unknown',
+    tool: 'process_run',
+    summary: 'Run npm test',
+    risk: 'execute',
+    expiresAt: new Date(Date.now() + 60_000).toISOString()
+  };
+  const host = harness({
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [{ id: 'call-process-unknown', name: 'process_run', arguments: JSON.stringify({ command: 'npm', args: ['test'] }) }]
+      },
+      {
+        content: '',
+        toolCalls: [{ id: 'call-process-retry', name: 'process_run', arguments: JSON.stringify({ command: 'npm', args: ['test'] }) }]
+      },
+      { content: 'The process outcome is uncertain, so I will verify before another attempt.', toolCalls: [] }
+    ],
+    invoke() { return { approvalRequired: true, approval }; }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Run the tests.', mode: 'goal', modelRef: 'chat:test' });
+  await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'waiting-approval'));
+  const resumed = host.commands.get(__testing.commands.reject).handler({
+    approvalId: approval.id,
+    approvalResult: {
+      approved: false,
+      rejected: true,
+      failed: true,
+      tool: 'process_run',
+      errorCode: 'AGENT_STALE_WORKSPACE',
+      errorMessage: 'The active workspace changed before the approved Agent operation completed.',
+      outcome: 'unknown',
+      mayHaveExecuted: true
+    }
+  });
+  assert.equal(resumed.accepted, true);
+  const completed = await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'completed'));
+
+  assert.equal(host.toolCalls.length, 1, 'the retry must be blocked before reaching the host tool broker');
+  assert.match(host.modelCalls[0].messages[0].content, /do not retry process_run automatically/i);
+  const unknownResult = host.modelCalls[1].messages.find((message) => message.tool_call_id === 'call-process-unknown');
+  assert.match(JSON.parse(unknownResult.content).retryGuidance, /Do not automatically retry process_run/);
+  const blockedResult = host.modelCalls[2].messages.find((message) => message.tool_call_id === 'call-process-retry');
+  assert.equal(JSON.parse(blockedResult.content).retryBlocked, true);
+  assert.equal(completed.activeSession.timeline.filter((item) => item.kind === 'tool' && item.status === 'failed').length, 2);
+  assert.equal(completed.activeSession.goal.status, 'blocked');
+  await deactivate();
+});
+
 test('treats a host-cancelled approved process as a blocked goal result', async () => {
   await deactivate();
   const approval = {
