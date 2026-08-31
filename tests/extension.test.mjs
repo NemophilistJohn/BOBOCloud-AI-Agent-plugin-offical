@@ -703,7 +703,70 @@ test('consumes an approved host execution failure without reporting a user rejec
   await deactivate();
 });
 
-test('blocks automatic process retries after an unknown approved outcome', async () => {
+test('accepts a toolless unavailable terminal result only for an exact pending approval id', async () => {
+  const cases = [
+    { code: 'AGENT_APPROVAL_NOT_FOUND', outcome: 'unknown', mayHaveExecuted: true },
+    { code: 'AGENT_APPROVAL_EXPIRED', outcome: 'not-started', mayHaveExecuted: false }
+  ];
+  for (const [index, terminal] of cases.entries()) {
+    await deactivate();
+    const approval = {
+      id: index === 0 ? 'a'.repeat(180) : 'approval-expired-without-tool',
+      tool: 'workspace_write',
+      summary: 'Replace src/example.js',
+      risk: 'write',
+      expiresAt: new Date(Date.now() + 60_000).toISOString()
+    };
+    const callId = 'call-toolless-' + index;
+    const host = harness({
+      modelResponses: [
+        {
+          content: '',
+          toolCalls: [{
+            id: callId,
+            name: 'workspace_write',
+            arguments: JSON.stringify({ path: 'src/example.js', content: 'new' })
+          }]
+        },
+        { content: 'The unavailable approval was closed safely.', toolCalls: [] }
+      ],
+      invoke() { return { approvalRequired: true, approval }; }
+    });
+    await activate(host.context);
+    host.commands.get(__testing.commands.send).handler({ text: 'Recover stale approval.', mode: 'goal', modelRef: 'chat:test' });
+    await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'waiting-approval'));
+    const reject = host.commands.get(__testing.commands.reject).handler;
+    const envelope = {
+      approved: false,
+      rejected: true,
+      failed: true,
+      errorCode: terminal.code,
+      errorMessage: 'The Agent approval is unavailable.',
+      outcome: terminal.outcome,
+      mayHaveExecuted: terminal.mayHaveExecuted
+    };
+
+    if (index === 0) {
+      assert.equal(reject({ approvalId: approval.id + '-suffix', approvalResult: envelope }).accepted, false, 'approval ids must not match after truncation');
+      assert.equal(reject({ approvalId: approval.id, approvalResult: { ...envelope, errorCode: 'AGENT_OPERATION_FAILED' } }).accepted, false);
+      assert.equal(reject({ approvalId: approval.id, approvalResult: { ...envelope, tool: '' } }).accepted, false);
+      assert.equal(reject({ approvalId: approval.id, approvalResult: { ...envelope, tool: 'process_run' } }).accepted, false);
+    }
+
+    assert.equal(reject({ approvalId: approval.id, approvalResult: envelope }).accepted, true);
+    const completed = await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'completed'));
+    const delivered = host.modelCalls.flatMap((call) => call.messages)
+      .find((message) => message.role === 'tool' && message.tool_call_id === callId);
+    const result = JSON.parse(delivered.content);
+    assert.equal(result.failed, true);
+    assert.equal(result.errorCode, terminal.code);
+    assert.equal(result.tool, 'workspace_write', 'the exact pending call supplies the missing internal tool identity');
+    assert.equal(completed.activeSession.goal.status, 'blocked');
+  }
+  await deactivate();
+});
+
+test('allows read-only verification but blocks a matching process retry after an unknown approved outcome', async () => {
   await deactivate();
   const approval = {
     id: 'approval-process-unknown',
@@ -720,11 +783,18 @@ test('blocks automatic process retries after an unknown approved outcome', async
       },
       {
         content: '',
+        toolCalls: [{ id: 'call-process-verify', name: 'workspace_read', arguments: JSON.stringify({ path: 'test-results.json' }) }]
+      },
+      {
+        content: '',
         toolCalls: [{ id: 'call-process-retry', name: 'process_run', arguments: JSON.stringify({ command: 'npm', args: ['test'] }) }]
       },
       { content: 'The process outcome is uncertain, so I will verify before another attempt.', toolCalls: [] }
     ],
-    invoke() { return { approvalRequired: true, approval }; }
+    invoke(tool, input) {
+      if (tool === 'workspace_read') return { path: input.path, content: '{}', sha256: 'a'.repeat(64), size: 2 };
+      return { approvalRequired: true, approval };
+    }
   });
   await activate(host.context);
   host.commands.get(__testing.commands.send).handler({ text: 'Run the tests.', mode: 'goal', modelRef: 'chat:test' });
@@ -745,13 +815,78 @@ test('blocks automatic process retries after an unknown approved outcome', async
   assert.equal(resumed.accepted, true);
   const completed = await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'completed'));
 
-  assert.equal(host.toolCalls.length, 1, 'the retry must be blocked before reaching the host tool broker');
-  assert.match(host.modelCalls[0].messages[0].content, /do not retry process_run automatically/i);
-  const unknownResult = host.modelCalls[1].messages.find((message) => message.tool_call_id === 'call-process-unknown');
-  assert.match(JSON.parse(unknownResult.content).retryGuidance, /Do not automatically retry process_run/);
-  const blockedResult = host.modelCalls[2].messages.find((message) => message.tool_call_id === 'call-process-retry');
-  assert.equal(JSON.parse(blockedResult.content).retryBlocked, true);
+  assert.deepEqual(host.toolCalls.map((call) => call.tool), ['process_run', 'workspace_read']);
+  assert.match(host.modelCalls[0].messages[0].content, /do not repeat the same workspace_write target or process_run invocation automatically/i);
+  const deliveredMessages = host.modelCalls.flatMap((call) => call.messages).filter((message) => message.role === 'tool');
+  const unknownResult = deliveredMessages.find((message) => message.tool_call_id === 'call-process-unknown');
+  assert.match(JSON.parse(unknownResult.content).retryGuidance, /Do not automatically repeat the matching process_run operation/);
+  const blockedResult = JSON.parse(deliveredMessages.find((message) => message.tool_call_id === 'call-process-retry').content);
+  assert.equal(blockedResult.retryBlocked, true);
+  assert.equal(blockedResult.relatedUnknownCallId, 'call-process-unknown');
+  assert.ok(deliveredMessages.some((message) => message.tool_call_id === 'call-process-verify'), 'read-only verification must reach the model');
   assert.equal(completed.activeSession.timeline.filter((item) => item.kind === 'tool' && item.status === 'failed').length, 2);
+  assert.equal(completed.activeSession.goal.status, 'blocked');
+  await deactivate();
+});
+
+test('blocks only the matching direct unknown write target and allows an unrelated write', async () => {
+  await deactivate();
+  const host = harness({
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [{
+          id: 'call-write-unknown',
+          name: 'workspace_write',
+          arguments: JSON.stringify({ path: 'src/example.js', content: 'first' })
+        }]
+      },
+      {
+        content: '',
+        toolCalls: [{
+          id: 'call-write-retry',
+          name: 'workspace_write',
+          arguments: JSON.stringify({ path: './src/example.js', content: 'second' })
+        }]
+      },
+      {
+        content: '',
+        toolCalls: [{
+          id: 'call-write-other',
+          name: 'workspace_write',
+          arguments: JSON.stringify({ path: 'src/other.js', content: 'safe' })
+        }]
+      },
+      { content: 'I left the uncertain target untouched and updated only the unrelated file.', toolCalls: [] }
+    ],
+    invoke(tool, input) {
+      if (input.path === 'src/example.js') {
+        return {
+          approved: false,
+          rejected: true,
+          failed: true,
+          tool,
+          errorCode: 'AGENT_STALE_WORKSPACE',
+          errorMessage: 'The workspace changed after the write may have committed.',
+          outcome: 'unknown',
+          mayHaveExecuted: true
+        };
+      }
+      return { approved: true, tool, path: input.path, sha256: 'b'.repeat(64) };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Update two files safely.', mode: 'goal', modelRef: 'chat:test' });
+  const completed = await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'completed'));
+
+  assert.deepEqual(host.toolCalls.map((call) => call.input.path), ['src/example.js', 'src/other.js']);
+  const deliveredMessages = host.modelCalls.flatMap((call) => call.messages).filter((message) => message.role === 'tool');
+  const unknownResult = JSON.parse(deliveredMessages.find((message) => message.tool_call_id === 'call-write-unknown').content);
+  assert.match(unknownResult.retryGuidance, /matching workspace_write operation/);
+  const blockedResult = JSON.parse(deliveredMessages.find((message) => message.tool_call_id === 'call-write-retry').content);
+  assert.equal(blockedResult.retryBlocked, true);
+  assert.equal(blockedResult.relatedUnknownCallId, 'call-write-unknown');
+  assert.ok(deliveredMessages.some((message) => message.tool_call_id === 'call-write-other'));
   assert.equal(completed.activeSession.goal.status, 'blocked');
   await deactivate();
 });

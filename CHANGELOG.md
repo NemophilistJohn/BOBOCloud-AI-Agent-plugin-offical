@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.3.3 - 2026-09-01
+
+- Treat unknown `workspace_write` and `process_run` outcomes uniformly for approval and direct `auto`/`full` execution results.
+- Block only the matching normalized write target or process invocation during the current run, while retaining read-only verification and unrelated side-effect targets.
+- Include the original unknown tool-call id in a blocked retry result so the model can correlate the safety decision without another host invocation.
+- Recover expired or evicted approvals whose trusted terminal envelope omits `tool`, but only for an exact pending id and the two explicit approval-unavailable error codes.
+
 ## 1.3.2 - 2026-09-01
 
 - Consume host-reported post-approval execution failures as failed tool results instead of leaving a session waiting forever or reporting a user rejection.
