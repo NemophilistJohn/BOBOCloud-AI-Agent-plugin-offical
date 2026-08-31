@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.3.2 - 2026-09-01
+
+- Consume host-reported post-approval execution failures as failed tool results instead of leaving a session waiting forever or reporting a user rejection.
+- Preserve compatibility with older plugins through the existing rejected-result branch while requiring BOBOCLOUD 2.8.1 for reliable terminal delivery.
+- Mark potentially started process failures as unknown outcomes, tell the model not to retry automatically, and block another `process_run` during that model run.
+
 ## 1.3.1 - 2026-08-31
 
 - Stop rejected, cancelled, timed-out, or failed tool operations from executing stale sibling calls.

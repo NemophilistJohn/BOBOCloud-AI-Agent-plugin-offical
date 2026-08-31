@@ -19,7 +19,7 @@ test('builds a deterministic schema-1 package with complete integrity coverage',
   const verified = await verifyPackage(second.artifactPath, { compareWorkspace: true, verifyChecksum: true });
   assert.equal(verified.manifest.id, 'bobocloud.ai-agent');
   assert.equal(verified.manifest.engines.pluginApi, '^1.5.0');
-  assert.equal(verified.manifest.engines.bobocloud, '>=2.8.0 <3.0.0');
+  assert.equal(verified.manifest.engines.bobocloud, '>=2.8.1 <3.0.0');
   assert.deepEqual(verified.files, [
     'dist/extension.js',
     'language-packs/en/messages.json',
