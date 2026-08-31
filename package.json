@@ -1,6 +1,6 @@
 {
   "name": "@bobocloud/ai-agent-plugin-official",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "private": true,
   "type": "module",
   "description": "Official local AI Agent plugin for BOBOCLOUD.",
