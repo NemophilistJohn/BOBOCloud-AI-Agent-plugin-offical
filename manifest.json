@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "id": "bobocloud.ai-agent",
   "displayName": "BOBOCLOUD AI Agent",
-  "description": "Official local workspace Agent with goal mode, Skills, structured tools, and explicit approvals.",
-  "version": "1.3.3",
+  "description": "Official local workspace Agent with dynamic Goals, progressive Skills, rolling checkpoints, streaming, and structured tools.",
+  "version": "1.4.0",
   "engines": {
     "bobocloud": ">=2.8.1 <3.0.0",
     "pluginApi": "^1.5.0"
@@ -32,10 +32,10 @@
   "integrity": {
     "algorithm": "sha256",
     "files": {
-      "dist/extension.js": "a1ec017b93cd953d5b4ee00f573a4744b416963deee6459acba6f95f462d8123",
-      "language-packs/en/messages.json": "f85650b903814ed8d1069b47e98ee49a462b3079b86ea055c4e694950b9626d5",
-      "language-packs/ja/messages.json": "bff5095807a713629bdf49ddfd146a95f2dec9b5522509c753924c747f4eba0d",
-      "language-packs/zh-CN/messages.json": "379f3de68ee2fd875fb38d98b36b2257ae93be1104a681c276e909b6a70e94a5"
+      "dist/extension.js": "f0d5e5f906ed45fe7c12a94237ed1aa729b5ba24510e6c88e107d26cb7b48d37",
+      "language-packs/en/messages.json": "1513e377d33408ccb6d6888e9308d5cfa17dba967c91553f74da757d5d661402",
+      "language-packs/ja/messages.json": "1be7a9d5e142ae667b8e3670ebe985a003cee409a0a05abd5986bca80a3b164c",
+      "language-packs/zh-CN/messages.json": "21666ab8627d51ce3dd9dafec4fda31fdf34e38b87948b8d14693bcd5dc4f367"
     }
   }
 }
