@@ -68,9 +68,10 @@ test('ships flat and complete English, Simplified Chinese, and Japanese message 
   }
   const source = await fs.readFile(path.join(root, 'src', 'extension.js'), 'utf8');
   const prefixes = new Set(['agent', 'command', 'session', 'goal', 'state', 'error', 'timeline', 'approval', 'tool', 'message']);
+  const protocolKeys = new Set(['state.merge', 'session.merge', 'message.upsert', 'timeline.upsert']);
   const referenced = [...source.matchAll(/['"]([a-z]+(?:\.[A-Za-z0-9]+)+)['"]/g)]
     .map((match) => match[1])
-    .filter((key) => prefixes.has(key.split('.')[0]));
+    .filter((key) => prefixes.has(key.split('.')[0]) && !protocolKeys.has(key));
   const missing = [...new Set(referenced)].filter((key) => !Object.hasOwn(catalogs[0], key));
   assert.deepEqual(missing, [], 'every plugin-owned visible string key must be localized');
 });

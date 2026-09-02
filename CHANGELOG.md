@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.4.0 - 2026-09-01
+
+- Add dynamic Goal plans through a bounded plugin-internal `goal_update` tool while preserving host-owned tool authority.
+- Load selected Skills progressively from metadata, bind reads to the discovered revision, deduplicate concurrent loads, and keep bounded loaded guidance across checkpoints.
+- Replace append-only compaction segments with repeatable rolling context checkpoints sized from declared model context and output limits.
+- Discover Plugin API 1.6 tool descriptors and parallelize only bounded batches marked both read-only and parallel-safe; Plugin API 1.5 falls back to list/read-only compatibility rules and keeps search serial.
+- Stream ordered content and reasoning events into draft messages and non-persistent thought timelines, rejecting malformed or duplicate event sequences.
+- Publish streaming progress through versioned incremental Agent state operations and recover a CAS miss or unsupported host with a complete state snapshot.
+- Preserve requested reasoning preferences while reporting the host/model effective tier, including models that expose no native reasoning tier.
+- Retain all 1.3.2/1.3.3 approval-terminal and unknown-side-effect protections, plus cancellation cleanup for in-flight progressive Skill events.
+- Preserve API 1.6 nullable capability declarations, honor the host effective-effort map and the lower of provider/output request limits, and cancel malformed streams promptly.
+- Stop every later sibling tool after a failed parallel read batch, and preserve explicitly updated blocked, pending, or in-progress Goal steps instead of fabricating completion.
+
 ## 1.3.3 - 2026-09-01
 
 - Treat unknown `workspace_write` and `process_run` outcomes uniformly for approval and direct `auto`/`full` execution results.

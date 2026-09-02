@@ -21,6 +21,7 @@ function harness(options = {}) {
   const toolCalls = [];
   const cancellations = [];
   const writes = [];
+  const patches = [];
   const subscriptions = [];
   let descriptor = null;
   let modelListCalls = 0;
@@ -28,6 +29,7 @@ function harness(options = {}) {
   let storageWriteCalls = 0;
   let commandRegisterCalls = 0;
   let stateWriteCalls = 0;
+  let providerVersion = 0;
   const modelResponses = [...(options.modelResponses || [{ content: 'Done.', toolCalls: [] }])];
   const context = {
     subscriptions: {
@@ -46,24 +48,47 @@ function harness(options = {}) {
       async register(value) {
         descriptor = value;
         let active = true;
-        return {
+        const provider = {
           id: value.id,
           async setState(state) {
             if (!active) return;
             stateWriteCalls += 1;
             states.push(structuredClone(state));
             if (typeof options.stateWrite === 'function') await options.stateWrite(state, stateWriteCalls);
+            providerVersion += 1;
+            return { version: providerVersion };
           },
           clearState() {},
           dispose() { active = false; }
         };
+        if (options.incrementalState) {
+          provider.updateState = async (patch) => {
+            patches.push(structuredClone(patch));
+            if (typeof options.updateState === 'function') {
+              const result = await options.updateState(patch, providerVersion);
+              if (result) {
+                if (result.applied && Number.isSafeInteger(result.version)) providerVersion = result.version;
+                return result;
+              }
+            }
+            if (patch.baseVersion !== providerVersion) return { applied: false, version: providerVersion };
+            providerVersion += 1;
+            return { applied: true, version: providerVersion };
+          };
+        }
+        return provider;
       }
     },
     models: {
       async list() {
         modelListCalls += 1;
         if (typeof options.modelsList === 'function') return options.modelsList(modelListCalls);
-        return { models: [{ ref: 'chat:test', purpose: 'chat', name: 'Test', provider: 'test', modelId: 'test-1', configured: true }] };
+        return {
+          models: [{
+            ref: 'chat:test', purpose: 'chat', name: 'Test', provider: 'test', modelId: 'test-1', configured: true,
+            ...(options.modelCapabilities ? { capabilities: options.modelCapabilities } : {})
+          }]
+        };
       },
       async generate(args) {
         if (String(args.requestId || '').startsWith('title-')) {
@@ -91,9 +116,9 @@ function harness(options = {}) {
         if (typeof options.skillsList === 'function') return options.skillsList(skillListCalls);
         return { skills: [{ id: 'skill-test', name: 'Test Skill', description: 'Testing instructions', source: 'workspace' }] };
       },
-      async read(skillId) {
+      async read(skillId, revision) {
         assert.equal(skillId, 'skill-test');
-        if (typeof options.skillRead === 'function') return options.skillRead(skillId);
+        if (typeof options.skillRead === 'function') return options.skillRead(skillId, revision);
         return { id: skillId, name: 'Test Skill', description: 'Testing instructions', source: 'workspace', content: 'Always inspect the target before editing.' };
       }
     },
@@ -112,6 +137,15 @@ function harness(options = {}) {
       onDidChange(listener) { return { dispose() {}, listener }; }
     }
   };
+  if (typeof options.generateStream === 'function') {
+    context.models.generateStream = async (args, onEvent) => {
+      modelCalls.push(structuredClone(args));
+      return options.generateStream(args, onEvent);
+    };
+  }
+  if (options.toolsList !== undefined) {
+    context.tools.list = async () => typeof options.toolsList === 'function' ? options.toolsList() : options.toolsList;
+  }
   return {
     context,
     commands,
@@ -121,6 +155,7 @@ function harness(options = {}) {
     toolCalls,
     cancellations,
     writes,
+    patches,
     subscriptions,
     get descriptor() { return descriptor; }
   };
@@ -243,8 +278,41 @@ test('registers a host-rendered Agent and completes a goal with Skill-guided too
     modelResponses: [
       {
         content: '',
-        reasoning: 'I should inspect the requested file first.',
+        reasoning: 'I should plan the task and load the selected instructions first.',
+        toolCalls: [
+          {
+            id: 'call-goal',
+            name: 'goal_update',
+            arguments: JSON.stringify({
+              title: 'Inspect the requested file',
+              steps: [
+                { title: 'Load relevant guidance', status: 'in-progress' },
+                { title: 'Inspect src/example.js', status: 'pending' },
+                { title: 'Report verified state', status: 'pending' }
+              ]
+            })
+          },
+          { id: 'call-skill', name: 'skill_load', arguments: JSON.stringify({ id: 'skill-test' }) }
+        ]
+      },
+      {
+        content: '',
         toolCalls: [{ id: 'call-read', name: 'workspace_read', arguments: JSON.stringify({ path: 'src/example.js' }) }]
+      },
+      {
+        content: '',
+        toolCalls: [{
+          id: 'call-goal-complete',
+          name: 'goal_update',
+          arguments: JSON.stringify({
+            title: 'Inspect the requested file',
+            steps: [
+              { title: 'Load relevant guidance', status: 'completed' },
+              { title: 'Inspect src/example.js', status: 'completed' },
+              { title: 'Report verified state', status: 'completed' }
+            ]
+          })
+        }]
       },
       { content: 'The file was inspected and no change was needed.', toolCalls: [] }
     ]
@@ -270,18 +338,88 @@ test('registers a host-rendered Agent and completes a goal with Skill-guided too
   assert.equal(sent.accepted, true);
   const completed = await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'completed'));
   assert.equal(completed.activeSession.goal.status, 'completed');
+  assert.deepEqual(completed.activeSession.goal.steps.map((step) => step.title), [
+    'Load relevant guidance', 'Inspect src/example.js', 'Report verified state'
+  ]);
   assert.equal(completed.activeSession.messages.at(-1).content, 'The file was inspected and no change was needed.');
   assert.equal(host.toolCalls[0].tool, 'workspace_read');
   assert.equal(host.modelCalls[0].reasoningEffort, 'high');
   assert.equal(host.modelCalls[0].maxTokens, 12288);
-  assert.equal(host.modelCalls[0].requestId, host.modelCalls[1].requestId, 'one run must keep one cancellable request id');
-  assert.match(host.modelCalls[0].messages[0].content, /Always inspect the target before editing/);
+  assert.equal(new Set(host.modelCalls.map((call) => call.requestId)).size, 1, 'one run must keep one cancellable request id');
+  assert.doesNotMatch(host.modelCalls[0].messages[0].content, /Always inspect the target before editing/, 'Skill bodies are not loaded eagerly');
+  assert.match(host.modelCalls[1].messages.find((message) => message.tool_call_id === 'call-skill').content, /Always inspect the target before editing/);
   assert.equal(completed.activeSession.timeline.some((item) => item.kind === 'skill'), true);
   const thought = completed.activeSession.timeline.find((item) => item.kind === 'thought');
-  assert.match(thought.detail, /inspect the requested file first/);
+  assert.match(thought.detail, /plan the task/);
   assert.match(thought.title, /^Thought for \d+s$/);
   assert.equal(JSON.stringify(host.writes).includes('I should inspect the requested file first.'), false);
   assert.equal(host.writes.length > 0, true);
+  await deactivate();
+});
+
+test('preserves explicit blocked, pending, and in-progress Goal steps when the model stops', async () => {
+  await deactivate();
+  const host = harness({
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [{
+          id: 'call-goal-blocked',
+          name: 'goal_update',
+          arguments: JSON.stringify({
+            title: 'Complete a partially blocked task',
+            steps: [
+              { title: 'Verified prerequisite', status: 'completed' },
+              { title: 'Wait for unavailable input', status: 'blocked' },
+              { title: 'Resume dependent work', status: 'pending' },
+              { title: 'Continue active inspection', status: 'in-progress' }
+            ]
+          })
+        }]
+      },
+      { content: 'The goal is blocked on unavailable input.', toolCalls: [] }
+    ]
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Work until genuinely blocked.', mode: 'goal', modelRef: 'chat:test' });
+  const completed = await waitFor(() => __testing.getState().activeSession?.status === 'completed' && __testing.getState().activeSession);
+
+  assert.equal(completed.goal.status, 'blocked');
+  assert.deepEqual(completed.goal.steps.map((step) => step.status), ['completed', 'blocked', 'pending', 'in-progress']);
+  await deactivate();
+});
+
+test('reuses one progressive read for repeated loads of the same selected Skill', async () => {
+  await deactivate();
+  let reads = 0;
+  const host = harness({
+    skillsList() {
+      return { skills: [{ id: 'skill-test', name: 'Test Skill', description: 'Testing instructions', source: 'workspace', revision: 'rev-1', sizeBytes: 128, estimatedTokens: 32 }] };
+    },
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [
+          { id: 'call-skill-a', name: 'skill_load', arguments: JSON.stringify({ id: 'skill-test' }) },
+          { id: 'call-skill-b', name: 'skill_load', arguments: JSON.stringify({ id: 'skill-test' }) }
+        ]
+      },
+      { content: 'The selected guidance was loaded once.', toolCalls: [] }
+    ],
+    async skillRead(skillId, revision) {
+      reads += 1;
+      assert.equal(revision, 'rev-1');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return { id: skillId, name: 'Test Skill', content: 'Use one canonical Skill body.' };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Load guidance', modelRef: 'chat:test', skillIds: ['skill-test'] });
+  await waitFor(() => __testing.getState().activeSession?.status === 'completed');
+  assert.equal(reads, 1);
+  const results = host.modelCalls[1].messages.filter((message) => message.role === 'tool').map((message) => JSON.parse(message.content));
+  assert.equal(results.length, 2);
+  assert.equal(results.some((result) => result.cached === true), true);
   await deactivate();
 });
 
@@ -346,10 +484,375 @@ test('passes xhigh reasoning to the host with its bounded output budget', async 
   });
   const completed = await waitFor(() => [...host.states].reverse().find((state) => state.activeSession?.status === 'completed'));
   assert.equal(completed.activeSession.reasoningEffort, 'xhigh');
+  assert.equal(Object.hasOwn(completed.activeSession, 'effectiveReasoningEffort'), false, 'Plugin API 1.5 snapshots must not gain 1.6-only fields');
   assert.equal(completed.activeSession.accessMode, 'auto');
   assert.equal(host.modelCalls[0].reasoningEffort, 'xhigh');
   assert.equal(host.modelCalls[0].maxTokens, 16384);
   assert.match(host.modelCalls[0].messages[0].content, /trusted host may approve policy-permitted operations/);
+  await deactivate();
+});
+
+test('uses declared model limits for rolling checkpoints and reports the effective reasoning tier', async () => {
+  await deactivate();
+  const history = [];
+  for (let turn = 0; turn < 3; turn += 1) {
+    history.push({ role: 'user', content: ('user-' + turn + ' ').padEnd(18_000, 'u') });
+    history.push({ role: 'assistant', content: ('assistant-' + turn + ' ').padEnd(18_000, 'a') });
+  }
+  const host = harness({
+    stored: storedSession(history, { reasoningEffort: 'max' }),
+    modelCapabilities: {
+      contextWindowTokens: 32768,
+      maxOutputTokens: 4096,
+      tools: true,
+      streaming: false,
+      parallelToolCalls: true,
+      reasoningEfforts: ['low', 'medium', 'high']
+    },
+    modelResponses: [
+      { content: 'Rolling checkpoint for the older turn.', toolCalls: [] },
+      {
+        content: 'Finished within the declared model window.',
+        toolCalls: [],
+        requestedReasoningEffort: 'max',
+        effectiveReasoningEffort: 'high'
+      }
+    ],
+    async generateStream() {
+      assert.fail('explicit streaming:false must use models.generate');
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({
+    sessionId: 'session-stored', text: 'Continue.', reasoningEffort: 'max', modelRef: 'chat:test'
+  });
+  const completed = await waitFor(() => __testing.getState().activeSession?.status === 'completed' && __testing.getState().activeSession);
+  assert.equal(host.modelCalls.length, 2, 'the real 32K window should checkpoint below the legacy 48K threshold');
+  assert.equal(Object.hasOwn(host.modelCalls[0], 'tools'), false);
+  assert.equal(host.modelCalls[1].maxTokens, 4096);
+  assert.equal(host.modelCalls[1].reasoningEffort, 'max', 'the host receives the portable requested tier');
+  assert.equal(completed.effectiveReasoningEffort, 'high');
+  assert.equal(__testing.getState().models[0].capabilities.contextWindowTokens, 32768);
+  await deactivate();
+});
+
+test('preserves unknown capability states, applies the effective effort map, and honors small output limits', async () => {
+  await deactivate();
+  const tinyModel = { capabilities: { contextWindowTokens: 512, maxOutputTokens: 384, requestOutputLimitTokens: 128 } };
+  const tinyBudget = __testing.contextBudgetForModel(tinyModel, 'xhigh');
+  assert.equal(__testing.outputTokensForModel(tinyModel, 'xhigh'), 128);
+  assert.equal(__testing.outputTokensForModel({
+    capabilities: { contextWindowTokens: 512, maxOutputTokens: 96, requestOutputLimitTokens: 262144 }
+  }, 'xhigh'), 96, 'the provider hard limit remains authoritative even if a malformed request limit is higher');
+  assert.equal(tinyBudget.windowTokens, 512);
+  assert.equal(tinyBudget.thresholdTokens <= 512, true);
+  assert.equal(tinyBudget.targetTokens <= tinyBudget.thresholdTokens, true);
+  assert.equal(tinyBudget.targetTokens >= 1, true);
+  const schema = (properties) => ({ type: 'object', properties, additionalProperties: false });
+  const streamedResponses = [
+    {
+      content: '',
+      toolCalls: [{ id: 'call-unknown-tools', name: 'workspace_read', arguments: JSON.stringify({ path: 'src/example.js' }) }],
+      requestedReasoningEffort: 'xhigh',
+      effectiveReasoningEffort: 'high'
+    },
+    {
+      content: 'Read through the compatibility path.',
+      toolCalls: [],
+      requestedReasoningEffort: 'xhigh',
+      effectiveReasoningEffort: 'high'
+    }
+  ];
+  const host = harness({
+    modelCapabilities: {
+      contextWindowTokens: 512,
+      maxOutputTokens: 384,
+      requestOutputLimitTokens: 128,
+      tools: null,
+      streaming: null,
+      parallelToolCalls: null,
+      reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      effectiveEffortMap: { low: 'none', medium: 'low', high: 'medium', xhigh: 'high', max: 'high' },
+      source: 'user-override'
+    },
+    toolsList: {
+      tools: [{
+        name: 'workspace_read', description: 'Read', inputSchema: schema({ path: { type: 'string' } }),
+        risk: 'low', readOnly: true, parallelSafe: true, requiresWorkspace: true
+      }]
+    },
+    async generateStream(args, onEvent) {
+      const result = streamedResponses.shift();
+      onEvent({
+        type: 'response.started', requestId: args.requestId, sequence: 0,
+        requestedReasoningEffort: 'xhigh', effectiveReasoningEffort: 'high'
+      });
+      onEvent({
+        type: 'response.completed', requestId: args.requestId, sequence: 1,
+        requestedReasoningEffort: 'xhigh', effectiveReasoningEffort: 'high', result
+      });
+      return result;
+    },
+    invoke(tool, input) {
+      assert.equal(tool, 'workspace_read');
+      return { path: input.path, content: 'ok', sha256: 'a'.repeat(64), size: 2 };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Inspect the file.', reasoningEffort: 'xhigh', modelRef: 'chat:test' });
+  const completed = await waitFor(() => __testing.getState().activeSession?.status === 'completed' && __testing.getState().activeSession);
+
+  assert.equal(host.modelCalls[0].maxTokens, 128, 'the plugin must not discard a host-valid output limit below 1024');
+  assert.equal(streamedResponses.length, 0, 'unknown streaming support should use the available API 1.6 stream path');
+  assert.equal(host.modelCalls[0].tools.some((tool) => tool.function.name === 'workspace_read'), true, 'unknown tool support remains compatible');
+  assert.deepEqual(host.toolCalls.map((call) => call.tool), ['workspace_read']);
+  assert.equal(completed.effectiveReasoningEffort, 'high');
+  assert.equal(__testing.getState().models[0].capabilities.tools, null);
+  assert.equal(__testing.getState().models[0].capabilities.contextWindowTokens, 512);
+  assert.equal(__testing.getState().models[0].capabilities.maxOutputTokens, 384);
+  assert.equal(__testing.getState().models[0].capabilities.requestOutputLimitTokens, 128);
+  assert.equal(__testing.getState().models[0].capabilities.streaming, null);
+  assert.equal(__testing.getState().models[0].capabilities.parallelToolCalls, null);
+  assert.equal(__testing.getState().models[0].capabilities.effectiveEffortMap.xhigh, 'high');
+  assert.equal(__testing.getState().models[0].capabilities.source, 'user-override');
+  await deactivate();
+});
+
+test('streams bounded model events through incremental state and resynchronizes after a CAS miss', async () => {
+  await deactivate();
+  let patchAttempt = 0;
+  const host = harness({
+    incrementalState: true,
+    modelCapabilities: {
+      contextWindowTokens: 128000,
+      maxOutputTokens: 16000,
+      tools: true,
+      streaming: true,
+      parallelToolCalls: true,
+      reasoningEfforts: ['low', 'medium', 'high', 'xhigh']
+    },
+    updateState(_patch, version) {
+      patchAttempt += 1;
+      if (patchAttempt === 1) return { applied: false, version };
+      if (patchAttempt === 2) return { applied: true };
+      return null;
+    },
+    async generateStream(args, onEvent) {
+      const emit = async (event) => {
+        onEvent({ requestId: args.requestId, ...event });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      };
+      await emit({ sequence: 0, type: 'response.started', effectiveReasoningEffort: 'high' });
+      await emit({ sequence: 1, type: 'content.delta', delta: 'Streamed ' });
+      await emit({ sequence: 2, type: 'reasoning.delta', delta: 'Inspecting the requested context.' });
+      await emit({ sequence: 3, type: 'content.delta', delta: 'answer.' });
+      await emit({ sequence: 4, type: 'usage', usage: { inputTokens: 42, outputTokens: 7 } });
+      await emit({ sequence: 5, type: 'response.completed', effectiveReasoningEffort: 'high' });
+      return {
+        content: 'Streamed answer.',
+        reasoning: 'Inspecting the requested context.',
+        toolCalls: [],
+        finishReason: 'stop',
+        usage: { inputTokens: 42, outputTokens: 7 },
+        requestedReasoningEffort: 'xhigh',
+        effectiveReasoningEffort: 'high'
+      };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Stream output', reasoningEffort: 'xhigh', modelRef: 'chat:test' });
+  const completed = await waitFor(() => __testing.getState().activeSession?.status === 'completed' && __testing.getState().activeSession);
+  assert.equal(completed.messages.at(-1).content, 'Streamed answer.');
+  assert.equal(completed.effectiveReasoningEffort, 'high');
+  assert.equal(completed.timeline.find((item) => item.kind === 'thought').status, 'completed');
+  assert.equal(host.patches.length > 0, true);
+  assert.equal(host.patches.some((patch) => patch.operations.some((operation) => operation.type === 'message.upsert')), true);
+  assert.equal(host.patches.some((patch) => patch.operations.some((operation) => operation.type === 'timeline.upsert')), true);
+  assert.equal(host.states.length >= 3, true, 'rejected or unversioned patches must fall back to a full state snapshot');
+  await waitFor(() => host.writes.some((value) => value.sessions?.[0]?.status === 'completed'));
+  assert.equal(JSON.stringify(host.writes).includes('Inspecting the requested context.'), false, 'streamed thought detail must not persist');
+  await deactivate();
+});
+
+test('fails a stream with a duplicate sequence without trusting its final result', async () => {
+  await deactivate();
+  const host = harness({
+    modelCapabilities: {
+      contextWindowTokens: 128000,
+      maxOutputTokens: 16000,
+      tools: true,
+      streaming: true,
+      parallelToolCalls: true,
+      reasoningEfforts: ['medium']
+    },
+    async generateStream(args, onEvent) {
+      onEvent({ requestId: args.requestId, sequence: 0, type: 'response.started', effectiveReasoningEffort: 'medium' });
+      onEvent({ requestId: args.requestId, sequence: 1, type: 'content.delta', delta: 'Partial stream' });
+      onEvent({ requestId: args.requestId, sequence: 1, type: 'response.completed', effectiveReasoningEffort: 'medium' });
+      return { content: 'Untrusted final result', reasoning: '', toolCalls: [], finishReason: 'stop', effectiveReasoningEffort: 'medium' };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Check stream', modelRef: 'chat:test' });
+  const failed = await waitFor(() => __testing.getState().activeSession?.status === 'failed' && __testing.getState().activeSession);
+  assert.equal(failed.messages.some((message) => message.content === 'Untrusted final result'), false);
+  assert.equal(failed.messages.some((message) => message.content === 'Partial stream'), true);
+  assert.equal(failed.timeline.some((item) => item.kind === 'error' && /stream/i.test(item.detail)), true);
+  await waitFor(() => host.cancellations.includes(host.modelCalls[0].requestId));
+  await deactivate();
+});
+
+test('surfaces the canonical nested stream error envelope', async () => {
+  await deactivate();
+  const host = harness({
+    modelCapabilities: {
+      contextWindowTokens: 128000,
+      maxOutputTokens: 16000,
+      tools: true,
+      streaming: true,
+      parallelToolCalls: false,
+      reasoningEfforts: ['medium']
+    },
+    async generateStream(args, onEvent) {
+      onEvent({ requestId: args.requestId, sequence: 0, type: 'response.started', effectiveReasoningEffort: 'medium' });
+      onEvent({ requestId: args.requestId, sequence: 1, type: 'response.error', error: { code: 'AGENT_MODEL_FAILED', message: 'Provider stream disconnected.' } });
+      return { content: '', reasoning: '', toolCalls: [], finishReason: 'error', effectiveReasoningEffort: 'medium' };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Check provider stream', modelRef: 'chat:test' });
+  const failed = await waitFor(() => __testing.getState().activeSession?.status === 'failed' && __testing.getState().activeSession);
+  assert.equal(failed.timeline.some((item) => item.kind === 'error' && item.detail === 'Provider stream disconnected.'), true);
+  await deactivate();
+});
+
+test('rejects a successful stream that omits its terminal completion event', async () => {
+  await deactivate();
+  const host = harness({
+    modelCapabilities: {
+      contextWindowTokens: 128000,
+      maxOutputTokens: 16000,
+      tools: true,
+      streaming: true,
+      parallelToolCalls: false,
+      reasoningEfforts: ['medium']
+    },
+    async generateStream(args, onEvent) {
+      onEvent({ requestId: args.requestId, sequence: 0, type: 'response.started', effectiveReasoningEffort: 'medium' });
+      onEvent({ requestId: args.requestId, sequence: 1, type: 'content.delta', delta: 'Partial response' });
+      return { content: 'Untrusted final response', reasoning: '', toolCalls: [], finishReason: 'stop', effectiveReasoningEffort: 'medium' };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Check stream lifecycle', modelRef: 'chat:test' });
+  const failed = await waitFor(() => __testing.getState().activeSession?.status === 'failed' && __testing.getState().activeSession);
+  assert.equal(failed.messages.some((message) => message.content === 'Untrusted final response'), false);
+  assert.equal(failed.messages.some((message) => message.content === 'Partial response'), true);
+  await deactivate();
+});
+
+test('parallelizes only host-declared parallel-safe read tools and preserves result order', async () => {
+  await deactivate();
+  let activeReads = 0;
+  let maximumReads = 0;
+  let completedReads = 0;
+  const schema = (properties) => ({ type: 'object', properties, additionalProperties: false });
+  const host = harness({
+    modelCapabilities: {
+      contextWindowTokens: 128000,
+      maxOutputTokens: 16000,
+      tools: true,
+      streaming: false,
+      parallelToolCalls: true,
+      reasoningEfforts: ['medium']
+    },
+    toolsList: {
+      tools: [
+        { name: 'workspace_read', description: 'Read', inputSchema: schema({ path: { type: 'string' } }), risk: 'low', readOnly: true, parallelSafe: true, requiresWorkspace: true },
+        { name: 'workspace_search', description: 'Search', inputSchema: schema({ query: { type: 'string' } }), risk: 'low', readOnly: true, parallelSafe: false, requiresWorkspace: true },
+        { name: 'goal_update', description: 'Host collision', inputSchema: schema({}), risk: 'low', readOnly: true, parallelSafe: true, requiresWorkspace: false }
+      ]
+    },
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [
+          { id: 'call-read-a', name: 'workspace_read', arguments: JSON.stringify({ path: 'a.js' }) },
+          { id: 'call-read-b', name: 'workspace_read', arguments: JSON.stringify({ path: 'b.js' }) },
+          { id: 'call-search', name: 'workspace_search', arguments: JSON.stringify({ query: 'needle' }) }
+        ]
+      },
+      { content: 'Parallel inspection completed.', toolCalls: [] }
+    ],
+    async invoke(tool, input) {
+      if (tool === 'workspace_read') {
+        activeReads += 1;
+        maximumReads = Math.max(maximumReads, activeReads);
+        await new Promise((resolve) => setTimeout(resolve, input.path === 'a.js' ? 25 : 10));
+        activeReads -= 1;
+        completedReads += 1;
+        return { path: input.path, content: input.path, sha256: 'a'.repeat(64), size: input.path.length };
+      }
+      assert.equal(completedReads, 2, 'non-parallel-safe search must wait for the read batch');
+      return { results: [], truncated: false };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Inspect files', modelRef: 'chat:test' });
+  await waitFor(() => __testing.getState().activeSession?.status === 'completed');
+  assert.equal(maximumReads, 2);
+  assert.equal(host.modelCalls[0].tools.some((tool) => tool.function.name === 'goal_update'), false, 'host descriptors cannot shadow internal control tools');
+  assert.deepEqual(host.toolCalls.map((call) => call.tool), ['workspace_read', 'workspace_read', 'workspace_search']);
+  assert.deepEqual(host.modelCalls[1].messages.filter((message) => message.role === 'tool').map((message) => message.tool_call_id), [
+    'call-read-a', 'call-read-b', 'call-search'
+  ]);
+  await deactivate();
+});
+
+test('short-circuits later sibling tools when any parallel read fails', async () => {
+  await deactivate();
+  const schema = (properties) => ({ type: 'object', properties, additionalProperties: false });
+  const host = harness({
+    modelCapabilities: {
+      contextWindowTokens: 128000,
+      maxOutputTokens: 16000,
+      tools: true,
+      streaming: false,
+      parallelToolCalls: true,
+      reasoningEfforts: ['medium'],
+      effectiveEffortMap: { medium: 'medium' },
+      source: 'official-catalog'
+    },
+    toolsList: {
+      tools: [
+        { name: 'workspace_read', description: 'Read', inputSchema: schema({ path: { type: 'string' } }), risk: 'low', readOnly: true, parallelSafe: true, requiresWorkspace: true },
+        { name: 'workspace_write', description: 'Write', inputSchema: schema({ path: { type: 'string' }, content: { type: 'string' } }), risk: 'medium', readOnly: false, parallelSafe: false, requiresWorkspace: true }
+      ]
+    },
+    modelResponses: [
+      {
+        content: '',
+        toolCalls: [
+          { id: 'call-read-fails', name: 'workspace_read', arguments: JSON.stringify({ path: 'missing.js' }) },
+          { id: 'call-read-succeeds', name: 'workspace_read', arguments: JSON.stringify({ path: 'present.js' }) },
+          { id: 'call-write-after-failure', name: 'workspace_write', arguments: JSON.stringify({ path: 'unsafe.js', content: 'must not run' }) }
+        ]
+      },
+      { content: 'The failed inspection stopped the remaining operations.', toolCalls: [] }
+    ],
+    async invoke(tool, input) {
+      if (tool === 'workspace_write') assert.fail('a write after a failed parallel read must not reach the host');
+      if (input.path === 'missing.js') throw Object.assign(new Error('File not found.'), { code: 'AGENT_OPERATION_FAILED' });
+      return { path: input.path, content: 'ok', sha256: 'a'.repeat(64), size: 2 };
+    }
+  });
+  await activate(host.context);
+  host.commands.get(__testing.commands.send).handler({ text: 'Read both files, then write only if inspection succeeds.', modelRef: 'chat:test' });
+  const completed = await waitFor(() => __testing.getState().activeSession?.status === 'completed' && __testing.getState().activeSession);
+
+  assert.deepEqual(host.toolCalls.map((call) => call.tool), ['workspace_read', 'workspace_read']);
+  assert.equal(completed.timeline.some((item) => item.kind === 'tool' && item.status === 'failed'), true);
+  assert.equal(host.modelCalls[1].messages.some((message) => message.tool_call_id === 'call-write-after-failure'), false);
   await deactivate();
 });
 
@@ -381,7 +884,7 @@ test('plans compaction by whole turns and strips private message metadata', () =
   assert.equal(__testing.modelMessages(messages).some((message) => Object.hasOwn(message, 'sessionMessageId')), false);
 });
 
-test('compacts repeatedly without recursive summaries and restores durable compaction state', async () => {
+test('rolls context checkpoints forward and restores durable checkpoint state', async () => {
   await deactivate();
   const large = (label) => label + ':' + ' context'.repeat(3500);
   const history = [];
@@ -403,9 +906,9 @@ test('compacts repeatedly without recursive summaries and restores durable compa
   const host = harness({
     stored,
     modelResponses: [
-      { content: 'First new durable summary.', toolCalls: [] },
+      { content: 'Existing durable fact. First new durable summary.', toolCalls: [] },
       { content: 'First compacted answer.', toolCalls: [] },
-      { content: 'Second new durable summary.', toolCalls: [] },
+      { content: 'Existing durable fact. First new durable summary. Second new durable summary.', toolCalls: [] },
       { content: 'Second compacted answer.', toolCalls: [] }
     ]
   });
@@ -425,15 +928,15 @@ test('compacts repeatedly without recursive summaries and restores durable compa
   assert.equal(Object.hasOwn(firstCompact, 'tools'), false, 'the summarizer cannot call tools');
   assert.match(firstCompact.messages[0].content, /stay under 1200 words/);
   assert.match(firstCompact.messages[0].content, /current progress/);
-  assert.doesNotMatch(firstCompact.messages[1].content, /Existing durable fact/, 'prior summaries are not recursively summarized');
+  assert.match(firstCompact.messages[1].content, /<previous_checkpoint>[\s\S]*Existing durable fact/, 'the prior checkpoint is merged explicitly');
   assert.equal(secondCompact.requestId.startsWith('compact-'), true);
-  assert.doesNotMatch(secondCompact.messages[1].content, /First new durable summary/, 'new summary segments remain immutable');
+  assert.match(secondCompact.messages[1].content, /<previous_checkpoint>[\s\S]*First new durable summary/, 'the latest checkpoint rolls into the next one');
   assert.equal(Array.isArray(firstNormal.tools), true);
   assert.equal(Array.isArray(secondNormal.tools), true);
   const firstSystem = firstNormal.messages[0].content;
   assert.equal(firstSystem.indexOf('official BOBOCLOUD local workspace agent') < firstSystem.indexOf('Existing durable fact.'), true);
   assert.equal(firstSystem.indexOf('Existing durable fact.') < firstSystem.indexOf('First new durable summary.'), true);
-  assert.equal(firstSystem.indexOf('First new durable summary.') < firstSystem.indexOf('## Skill: Test Skill'), true);
+  assert.doesNotMatch(firstSystem, /## Skill: Test Skill/, 'selected Skill bodies stay progressive until requested');
   assert.match(secondNormal.messages[0].content, /Second new durable summary/);
   assert.equal(firstNormal.messages.some((message) => Object.hasOwn(message, 'sessionMessageId')), false);
   assert.equal(completed.activeSession.compaction.count, 3);
@@ -442,7 +945,7 @@ test('compacts repeatedly without recursive summaries and restores durable compa
   assert.equal(host.states.some((state) => state.activeSession?.compacting === true && state.message === messages['state.compacting']), true);
 
   const persisted = await waitFor(() => [...host.writes].reverse().find((value) => value.sessions?.[0]?.compaction?.count === 3));
-  assert.equal(persisted.schemaVersion, 2);
+  assert.equal(persisted.schemaVersion, 3);
   assert.match(persisted.sessions[0].compaction.summary, /Existing durable fact/);
   assert.match(persisted.sessions[0].compaction.summary, /First new durable summary/);
   assert.match(persisted.sessions[0].compaction.summary, /Second new durable summary/);
@@ -1142,6 +1645,10 @@ test('rejects late Skill reads after a run is cancelled', async () => {
   const skill = deferred();
   let readStarted = false;
   const host = harness({
+    modelResponses: [{
+      content: '',
+      toolCalls: [{ id: 'call-late-skill', name: 'skill_load', arguments: JSON.stringify({ id: 'skill-test' }) }]
+    }],
     skillRead() {
       readStarted = true;
       return skill.promise;
@@ -1159,8 +1666,10 @@ test('rejects late Skill reads after a run is cancelled', async () => {
   await new Promise((resolve) => setTimeout(resolve, 20));
   const session = __testing.getState().activeSession;
   assert.equal(session.status, 'cancelled');
-  assert.equal(session.timeline.some((item) => item.kind === 'skill'), false);
-  assert.equal(host.modelCalls.length, 0);
+  const skillEvent = session.timeline.find((item) => item.kind === 'skill');
+  assert.equal(skillEvent.status, 'rejected');
+  assert.equal(skillEvent.detail.includes('Late Skill content.'), false);
+  assert.equal(host.modelCalls.length, 1);
   await deactivate();
 });
 
