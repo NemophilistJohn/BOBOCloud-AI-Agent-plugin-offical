@@ -4,7 +4,7 @@ Official local AI Agent plugin for BOBOCLOUD. It adds an Agent workbench as a pe
 
 The plugin is written in plain JavaScript and has no runtime dependencies or native modules. Privileged work remains in BOBOCLOUD's cross-platform host brokers, so one package can run on Windows, macOS, and Linux.
 
-Version `1.4.0` requires BOBOCLOUD `>=2.8.1 <3.0.0` and Plugin API `^1.5.0`. It runs on Plugin API 1.5 and feature-detects the 1.6 model, streaming, incremental-state, Skill-revision, and tool-catalog extensions.
+Version `1.4.1` requires BOBOCLOUD `>=2.8.1 <5.0.0` and Plugin API `^1.5.0`. It runs on Plugin API 1.5 and feature-detects the 1.6 model, streaming, incremental-state, Skill-revision, and tool-catalog extensions.
 
 ## Capabilities
 
@@ -55,15 +55,15 @@ npm run verify
 `npm run package` copies the self-contained source to `dist/extension.js`, regenerates every manifest integrity hash, and writes a deterministic artifact:
 
 ```text
-artifacts/bobocloud.ai-agent-1.4.0.boboplugin
-artifacts/bobocloud.ai-agent-1.4.0.boboplugin.sha256
+artifacts/bobocloud.ai-agent-1.4.1.boboplugin
+artifacts/bobocloud.ai-agent-1.4.1.boboplugin.sha256
 ```
 
 The archive contains only `manifest.json`, `dist/extension.js`, and the three locale catalogs. Source, tests, scripts, and repository metadata are intentionally excluded.
 
 ## Install
 
-Use BOBOCLOUD's Extensions view to install the `.boboplugin` archive, then enable the plugin. Version `1.4.0` requires BOBOCLOUD `2.8.1` or newer. Configure at least one Chat model in BOBOCLOUD's AI settings. The Agent activity item appears only while the plugin is enabled. On a Plugin API 1.5 host, generation remains non-streaming and state publication uses complete snapshots; the orchestration features remain available.
+Use BOBOCLOUD's Extensions view to install the `.boboplugin` archive, then enable the plugin. Version `1.4.1` requires BOBOCLOUD `2.8.1` or newer. Configure at least one Chat model in BOBOCLOUD's AI settings. The Agent activity item appears only while the plugin is enabled. On a Plugin API 1.5 host, generation remains non-streaming and state publication uses complete snapshots; the orchestration features remain available.
 
 The Agent does not share conversations with Chat and does not replace inline completion. It only reuses host-owned model connection profiles through opaque model references.
 
@@ -80,13 +80,13 @@ The Agent does not share conversations with Chat and does not replace inline com
 Marketplace artifact URL pattern:
 
 ```text
-https://raw.githubusercontent.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/v1.4.0/artifacts/bobocloud.ai-agent-1.4.0.boboplugin
+https://raw.githubusercontent.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/v1.4.1/artifacts/bobocloud.ai-agent-1.4.1.boboplugin
 ```
 
 The release workflow also publishes the same bytes as a GitHub Release asset:
 
 ```text
-https://github.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/releases/download/v1.4.0/bobocloud.ai-agent-1.4.0.boboplugin
+https://github.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/releases/download/v1.4.1/bobocloud.ai-agent-1.4.1.boboplugin
 ```
 
 ## 中文说明
@@ -95,4 +95,4 @@ https://github.com/NemophilistJohn/BOBOCloud-AI-Agent-plugin-offical/releases/do
 
 插件本身不接触 Node.js、Electron、绝对路径、Shell、网络、密钥或原始 IPC。文件写入和进程执行都必须经过 BOBOCLOUD 的显式审批，并由宿主在当前工作区边界内完成。
 
-`1.4.0` 保持 BOBOCLOUD 2.8.1 / Plugin API 1.5 兼容，并在 1.6 宿主上自动启用模型上下文窗口与有效思考档位、流式模型事件、CAS 增量状态、Skill 修订绑定和工具目录。Goal 计划由模型通过插件内部结构化工具动态维护；Skill 先提供元数据、相关时才加载正文；上下文按真实模型窗口滚动生成可恢复检查点；只有宿主声明为只读且可并行的工具才会并发执行。1.3.2/1.3.3 的审批终态和未知副作用防重试语义保持不变。访问模式仍不授予权限，真正的自动批准规则始终由可信宿主掌管。
+`1.4.1` 保持 BOBOCLOUD 2.8.1 / Plugin API 1.5 兼容，并在 1.6 宿主上自动启用模型上下文窗口与有效思考档位、流式模型事件、CAS 增量状态、Skill 修订绑定和工具目录。Goal 计划由模型通过插件内部结构化工具动态维护；Skill 先提供元数据、相关时才加载正文；上下文按真实模型窗口滚动生成可恢复检查点；只有宿主声明为只读且可并行的工具才会并发执行。1.3.2/1.3.3 的审批终态和未知副作用防重试语义保持不变。访问模式仍不授予权限，真正的自动批准规则始终由可信宿主掌管。

@@ -27,7 +27,7 @@ No plugin-provided HTML, CSS, SVG, DOM callback, executable path, shell string, 
 
 ## Plugin API Contract
 
-Version `1.4.0` targets BOBOCLOUD `>=2.8.1 <3.0.0` and Plugin API `^1.5.0`. The manifest remains compatible with API 1.5; every 1.6 optimization is selected by validated runtime fields or optional methods, never by guessing from a version string.
+Version `1.4.1` targets BOBOCLOUD `>=2.8.1 <5.0.0` and Plugin API `^1.5.0`. The manifest remains compatible with API 1.5; every 1.6 optimization is selected by validated runtime fields or optional methods, never by guessing from a version string.
 
 The runtime uses only these capabilities:
 
